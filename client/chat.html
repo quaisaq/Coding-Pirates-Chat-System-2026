@@ -2,26 +2,179 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Chat</title>
-    <link rel="stylesheet" href="chat.css">
+    <style>
+        body {
+            font-family: sans-serif;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 0 10px;
+        }
+
+        input {
+            padding: 8px;
+            margin: 4px 0;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        button {
+            padding: 8px 16px;
+        }
+
+        #messages {
+            list-style: none;
+            padding: 10px;
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+        }
+
+        #messages li {
+            padding: 4px 0;
+        }
+
+        #messages li.mine {
+            text-align: right;
+            color: #0066cc;
+        }
+
+        #messages li.system {
+            color: #888;
+            font-style: italic;
+        }
+
+        #sendForm {
+            display: flex;
+            gap: 8px;
+        }
+    </style>
 </head>
 <body>
     <div id="connect">
         <h1>Join chat</h1>
-        <input id="ip" placeholder="IP address (e.g. localhost)">
-        <input id="port" placeholder="Port (e.g. 5000)">
-        <button id="connectBtn">Connect</button>
-        <p id="status"></p>
+        <input id="username" placeholder="Username" maxlength="24" autocomplete="nickname">
+        <input id="ip" placeholder="IP address (e.g. localhost)" autocomplete="url">
+        <input id="port" placeholder="Port (e.g. 12345)" inputmode="numeric">
+        <button id="connectBtn" type="button">Connect</button>
+        <p id="status" role="status"></p>
     </div>
 
     <div id="chat" hidden>
-        <ul id="messages"></ul>
+        <ul id="messages" aria-live="polite"></ul>
         <form id="sendForm">
             <input id="message" placeholder="Type a message..." autocomplete="off">
-            <button>Send</button>
+            <button type="submit">Send</button>
         </form>
     </div>
 
-    <script src="js/chat.js"></script>
+    <script>
+        let socket;
+        let username;
+        let joined = false;
+
+        const connectDiv = document.getElementById("connect");
+        const chatDiv = document.getElementById("chat");
+        const statusText = document.getElementById("status");
+        const messages = document.getElementById("messages");
+        const messageInput = document.getElementById("message");
+        const connectButton = document.getElementById("connectBtn");
+
+        function addMessage(text, cssClass) {
+            const li = document.createElement("li");
+            li.textContent = text;
+            if (cssClass) li.className = cssClass;
+            messages.appendChild(li);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        connectButton.addEventListener("click", () => {
+            username = document.getElementById("username").value.trim();
+            const ip = document.getElementById("ip").value.trim();
+            const port = document.getElementById("port").value.trim();
+
+            if (!username || username.length > 24) {
+                statusText.textContent = "Choose a username with 1 to 24 characters.";
+                return;
+            }
+            if (!ip || !/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+                statusText.textContent = "Enter a valid IP address and port.";
+                return;
+            }
+
+            statusText.textContent = "Connecting...";
+            connectButton.disabled = true;
+            joined = false;
+
+            try {
+                socket = new WebSocket(`ws://${ip}:${port}`);
+            } catch {
+                statusText.textContent = "Could not connect. Check the address and port.";
+                connectButton.disabled = false;
+                return;
+            }
+
+            socket.onopen = () => {
+                socket.send(JSON.stringify({ type: "join", username }));
+            };
+
+            socket.onmessage = (event) => {
+                let data;
+                try {
+                    data = JSON.parse(event.data);
+                } catch {
+                    addMessage("Received an invalid message from the server.", "system");
+                    return;
+                }
+
+                switch (data.type) {
+                    case "joined":
+                        joined = true;
+                        connectDiv.hidden = true;
+                        chatDiv.hidden = false;
+                        addMessage(`Connected as ${data.username}.`, "system");
+                        messageInput.focus();
+                        break;
+                    case "user_joined":
+                        addMessage(`${data.username} joined the chat.`, "system");
+                        break;
+                    case "user_left":
+                        addMessage(`${data.username} left the chat.`, "system");
+                        break;
+                    case "message":
+                        addMessage(`${data.username}: ${data.text}`, data.username === username ? "mine" : "");
+                        break;
+                    case "error":
+                        statusText.textContent = data.message;
+                        addMessage(data.message, "system");
+                        break;
+                    default:
+                        addMessage("Received an unknown event from the server.", "system");
+                }
+            };
+
+            socket.onerror = () => {
+                statusText.textContent = "Could not connect.";
+            };
+
+            socket.onclose = () => {
+                if (joined) addMessage("Disconnected", "system");
+                joined = false;
+                connectDiv.hidden = false;
+                chatDiv.hidden = true;
+                connectButton.disabled = false;
+            };
+        });
+
+        document.getElementById("sendForm").addEventListener("submit", (event) => {
+            event.preventDefault();
+            const text = messageInput.value;
+            if (!joined || socket.readyState !== WebSocket.OPEN) return;
+
+            socket.send(JSON.stringify({ type: "message", text }));
+            messageInput.value = "";
+        });
+    </script>
 </body>
 </html>
