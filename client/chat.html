@@ -49,6 +49,25 @@
             display: flex;
             gap: 8px;
         }
+
+        .avatar {
+            width: 32px;
+            height: 32px;
+            object-fit: cover;
+            border-radius: 50%;
+            vertical-align: middle;
+            margin: 0 8px;
+        }
+
+        #roomForm {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        #roomForm[hidden] {
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -57,11 +76,19 @@
         <input id="username" placeholder="Username" maxlength="24" autocomplete="nickname">
         <input id="ip" placeholder="IP address (e.g. localhost)" autocomplete="url" value="10.59.123.15">
         <input id="port" placeholder="Port (e.g. 12345)" inputmode="numeric" value="12345">
+        <label for="icon">User icon (optional, image up to 2 MiB)</label>
+        <input id="icon" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
         <button id="connectBtn" type="button">Connect</button>
         <p id="status" role="status"></p>
     </div>
 
     <div id="chat" hidden>
+        <p id="currentRoom" role="status"></p>
+        <form id="roomForm" hidden>
+            <input id="roomName" placeholder="Join or create a room" maxlength="48" list="roomList" autocomplete="off" aria-label="Room name" value="Lobby">
+            <datalist id="roomList"></datalist>
+            <button type="submit">Join room</button>
+        </form>
         <ul id="messages" aria-live="polite"></ul>
         <form id="sendForm">
             <input id="message" placeholder="Type a message..." autocomplete="off">
@@ -73,6 +100,8 @@
         let socket;
         let username;
         let joined = false;
+        let room = null;
+        let changingRoom = false;
 
         const connectDiv = document.getElementById("connect");
         const chatDiv = document.getElementById("chat");
@@ -80,16 +109,52 @@
         const messages = document.getElementById("messages");
         const messageInput = document.getElementById("message");
         const connectButton = document.getElementById("connectBtn");
+        const roomForm = document.getElementById("roomForm");
+        const roomName = document.getElementById("roomName");
+        const currentRoom = document.getElementById("currentRoom");
+        const roomList = document.getElementById("roomList");
 
-        function addMessage(text, cssClass) {
+        function addMessage(text, cssClass, icon) {
             const li = document.createElement("li");
-            li.textContent = text;
+            if (typeof icon === "string" && icon.length <= 87416 &&
+                /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+=*$/.test(icon)) {
+                const image = document.createElement("img");
+                image.src = icon;
+                image.className = "avatar";
+                image.alt = "";
+                li.appendChild(image);
+            }
+            li.appendChild(document.createTextNode(text));
             if (cssClass) li.className = cssClass;
             messages.appendChild(li);
             messages.scrollTop = messages.scrollHeight;
         }
 
-        connectButton.addEventListener("click", () => {
+        async function loadIcon(file) {
+            if (!file) return null;
+            if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type) ||
+                file.size > 2 * 1024 * 1024) {
+                throw new Error("Choose a PNG, JPEG, GIF or WebP image up to 2 MiB.");
+            }
+            const url = URL.createObjectURL(file);
+            try {
+                const image = new Image();
+                image.src = url;
+                await image.decode();
+                const canvas = document.createElement("canvas");
+                const scale = Math.min(1, 64 / image.width, 64 / image.height);
+                canvas.width = Math.max(1, Math.round(image.width * scale));
+                canvas.height = Math.max(1, Math.round(image.height * scale));
+                const context = canvas.getContext("2d");
+                if (!context) throw new Error("Could not prepare your icon.");
+                context.drawImage(image, 0, 0, canvas.width, canvas.height);
+                return canvas.toDataURL("image/png");
+            } finally {
+                URL.revokeObjectURL(url);
+            }
+        }
+
+        connectButton.addEventListener("click", async () => {
             username = document.getElementById("username").value.trim();
             const ip = document.getElementById("ip").value.trim();
             const port = document.getElementById("port").value.trim();
@@ -106,6 +171,17 @@
             statusText.textContent = "Connecting...";
             connectButton.disabled = true;
             joined = false;
+            room = null;
+            changingRoom = false;
+
+            let icon;
+            try {
+                icon = await loadIcon(document.getElementById("icon").files[0]);
+            } catch (error) {
+                statusText.textContent = `Could not load icon: ${error.message}`;
+                connectButton.disabled = false;
+                return;
+            }
 
             try {
                 socket = new WebSocket(`ws://${ip}:${port}`);
@@ -116,7 +192,7 @@
             }
 
             socket.onopen = () => {
-                socket.send(JSON.stringify({ type: "join", username }));
+                socket.send(JSON.stringify({ type: "join", username, icon, features: ["rooms", "icons"] }));
             };
 
             socket.onmessage = (event) => {
@@ -131,9 +207,34 @@
                 switch (data.type) {
                     case "joined":
                         joined = true;
+                        messages.replaceChildren();
                         connectDiv.hidden = true;
                         chatDiv.hidden = false;
+                        room = data.room || null;
+                        roomForm.hidden = !Array.isArray(data.features) || !data.features.includes("rooms");
+                        currentRoom.textContent = room ? `Room: ${room}` : "This server does not support rooms.";
                         addMessage(`Connected as ${data.username}.`, "system");
+                        if (icon && (!Array.isArray(data.features) || !data.features.includes("icons"))) {
+                            addMessage("This server does not support user icons.", "system");
+                        }
+                        messageInput.focus();
+                        break;
+                    case "rooms":
+                        roomList.replaceChildren();
+                        for (const entry of data.rooms) {
+                            const option = document.createElement("option");
+                            option.value = entry.name;
+                            option.label = `${entry.users} users`;
+                            roomList.appendChild(option);
+                        }
+                        break;
+                    case "room_joined":
+                        if (room !== data.room) messages.replaceChildren();
+                        room = data.room;
+                        roomName.value = room;
+                        changingRoom = false;
+                        currentRoom.textContent = `Room: ${room}`;
+                        addMessage(`Joined room ${room}.`, "system");
                         messageInput.focus();
                         break;
                     case "user_joined":
@@ -143,9 +244,10 @@
                         addMessage(`${data.username} left the chat.`, "system");
                         break;
                     case "message":
-                        addMessage(`${data.username}: ${data.text}`, data.username === username ? "mine" : "");
+                        addMessage(`${data.username}: ${data.text}`, data.username === username ? "mine" : "", data.icon);
                         break;
                     case "error":
+                        changingRoom = false;
                         statusText.textContent = data.message;
                         addMessage(data.message, "system");
                         break;
@@ -161,16 +263,34 @@
             socket.onclose = () => {
                 if (joined) addMessage("Disconnected", "system");
                 joined = false;
+                changingRoom = false;
+                roomForm.hidden = true;
                 connectDiv.hidden = false;
                 chatDiv.hidden = true;
                 connectButton.disabled = false;
             };
         });
 
+        roomForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+            const requestedRoom = roomName.value.trim();
+            if (!joined || changingRoom || socket.readyState !== WebSocket.OPEN) return;
+            if (!requestedRoom || requestedRoom.length > 48) {
+                addMessage("Choose a room name with 1 to 48 characters.", "system");
+                return;
+            }
+            changingRoom = true;
+            socket.send(JSON.stringify({ type: "join_room", room: requestedRoom }));
+        });
+
         document.getElementById("sendForm").addEventListener("submit", (event) => {
             event.preventDefault();
             const text = messageInput.value;
             if (!joined || socket.readyState !== WebSocket.OPEN) return;
+            if (changingRoom) {
+                addMessage("Wait until the room change is confirmed before sending.", "system");
+                return;
+            }
 
             socket.send(JSON.stringify({ type: "message", text }));
             messageInput.value = "";
