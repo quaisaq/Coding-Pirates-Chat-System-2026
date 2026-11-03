@@ -1,0 +1,5 @@
+server/chat.db
+server/chat.db-journal
+server/chat.db-wal
+server/chat.db-shm
+__pycache__/

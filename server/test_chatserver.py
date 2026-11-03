@@ -1,7 +1,9 @@
 import asyncio
 import base64
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import websockets
 
@@ -19,6 +21,10 @@ ICON = "data:image/png;base64," + base64.b64encode(
 
 class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.database_path = Path(directory) / "chat.db"
+        chatserver.initialize_database(self.database_path)
+        self.addCleanup(chatserver.close_database)
         server = await self.enterAsyncContext(
             websockets.serve(chatserver.handler, "127.0.0.1", 0, max_size=None)
         )
@@ -150,15 +156,16 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
         await self.update_room(admin, "Managed", allowed_usernames=[f"Name{i}" for i in range(100)])
         self.assertEqual(len((await self.until(admin, "room_state"))["allowed_usernames"]), 100)
 
-    async def test_admin_departure_closes_room_and_moves_old_room_clients(self):
+    async def test_admin_departure_preserves_room_and_members(self):
         for mode in ("switch", "disconnect"):
+            room_name = f"Managed{mode}"
             admin = await self.connect_admin_client(f"Owner{mode}")
-            await self.enter_room(admin, "Managed")
+            await self.enter_room(admin, room_name)
             guest = await self.connect_admin_client(f"Guest{mode}")
-            await self.enter_room(guest, "Managed")
+            await self.enter_room(guest, room_name)
             old_client, _ = await self.connect(f"Old{mode}", modern=True)
             await self.until(old_client, "rooms")
-            await self.send(old_client, {"type": "join_room", "room": "Managed"})
+            await self.send(old_client, {"type": "join_room", "room": room_name})
             await self.until(old_client, "room_joined")
             await self.until(old_client, "rooms")
             await self.until(guest, "user_joined")
@@ -168,21 +175,117 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
                 await self.until(admin, "room_joined")
             else:
                 await admin.close()
-            event = await self.until(guest, "room_joined")
-            self.assertEqual(event["room"], "Lobby")
-            self.assertIn("admin left", event["reason"])
-            self.assertIsNone((await self.until(guest, "room_state"))["admin"])
+            await self.until(guest, "user_left")
             await self.until(guest, "rooms")
-            event = await self.until(old_client, "room_joined")
-            self.assertEqual(event["room"], "Lobby")
+            await self.until(old_client, "user_left")
             await self.until(old_client, "rooms")
-            self.assertNotIn("Managed", chatserver.rooms)
+            self.assertIn(room_name, chatserver.rooms)
+            self.assertEqual(chatserver.rooms[room_name].admin, f"Owner{mode}")
             await self.send(old_client, {"type": "message", "text": "Relocated"})
-            self.assertEqual((await self.receive(old_client))["room"], "Lobby")
-            self.assertEqual((await self.until(guest, "message"))["room"], "Lobby")
+            self.assertEqual((await self.receive(old_client))["room"], room_name)
+            self.assertEqual((await self.until(guest, "message"))["room"], room_name)
             await guest.close()
             await old_client.close()
             await admin.close()
+
+    async def test_persistent_history_limit_order_and_room_isolation(self):
+        connection, response = await self.connect("Writer", features=["history"], icon=ICON)
+        self.assertIn("history", response["features"])
+        self.assertEqual((await self.receive(connection))["messages"], [])
+        for index in range(105):
+            await self.send(connection, {"type": "message", "text": f"Message {index}"})
+            await self.receive(connection)
+        await connection.close()
+        self.assertEqual(chatserver.get_database().execute("SELECT count(*) FROM messages").fetchone()[0], 105)
+        chatserver.close_database()
+        chatserver.initialize_database(self.database_path)
+        reader, _ = await self.connect("Reader", features=["rooms", "history"])
+        history = await self.receive(reader)
+        self.assertEqual(history["room"], "Lobby")
+        self.assertEqual(len(history["messages"]), 100)
+        self.assertEqual([entry["text"] for entry in history["messages"]], [
+            f"Message {index}" for index in range(5, 105)
+        ])
+        self.assertEqual(history["messages"][0]["icon"], ICON)
+        self.assertTrue(history["messages"][0]["created_at"].endswith("Z"))
+        await self.until(reader, "rooms")
+        await self.send(reader, {"type": "join_room", "room": "Other"})
+        await self.until(reader, "room_joined")
+        self.assertEqual((await self.receive(reader))["messages"], [])
+        await self.until(reader, "rooms")
+        await self.send(reader, {"type": "message", "text": "Other room"})
+        await self.receive(reader)
+        await self.send(reader, {"type": "join_room", "room": "Other"})
+        await self.until(reader, "room_joined")
+        self.assertEqual([entry["text"] for entry in (await self.receive(reader))["messages"]], ["Other room"])
+
+    async def test_room_settings_and_private_history_survive_restart(self):
+        admin = await self.connect_admin_client("Owner")
+        await self.enter_room(admin, "Saved")
+        await self.update_room(admin, "Saved", private=True, allowed_usernames=["Friend"], background="#112233")
+        await self.until(admin, "room_state")
+        await self.until(admin, "rooms")
+        await self.send(admin, {"type": "message", "text": "Private history"})
+        await self.receive(admin)
+        await admin.close()
+        chatserver.close_database()
+        chatserver.initialize_database(self.database_path)
+        self.assertEqual(chatserver.rooms["Saved"], chatserver.Room("Owner", True, ["Friend"], "#112233"))
+        restored = await self.connect_admin_client("owner")
+        state = await self.enter_room(restored, "saved")
+        self.assertTrue(state["is_admin"])
+        await self.update_room(restored, "Saved", private=True, allowed_usernames=["Friend"], background="#334455")
+        await self.until(restored, "room_state")
+        stranger, _ = await self.connect("Stranger", features=["rooms", "history"])
+        await self.until(stranger, "history")
+        await self.until(stranger, "rooms")
+        await self.send(stranger, {"type": "join_room", "room": "Saved"})
+        self.assertEqual((await self.receive(stranger))["type"], "error")
+        await self.assert_quiet(stranger)
+        friend, _ = await self.connect("friend", features=["rooms", "history"])
+        await self.until(friend, "history")
+        await self.until(friend, "rooms")
+        await self.send(friend, {"type": "join_room", "room": "Saved"})
+        await self.until(friend, "room_joined")
+        self.assertEqual((await self.receive(friend))["messages"][0]["text"], "Private history")
+
+    async def test_failed_database_write_is_not_broadcast_or_acknowledged(self):
+        writer, _ = await self.connect("Writer")
+        reader, _ = await self.connect("Reader")
+        await self.receive(writer)
+        chatserver.get_database().execute("PRAGMA query_only = ON")
+        with self.assertLogs(level="ERROR") as logs:
+            await self.send(writer, {"type": "message", "text": "Cannot save"})
+            response = await self.receive(writer)
+            self.assertEqual(response["type"], "error")
+            self.assertIn("Database operation failed", response["message"])
+            await writer.wait_closed()
+        self.assertIn("Chat database operation failed", logs.output[0])
+        self.assertEqual(writer.close_code, 1011)
+        self.assertEqual((await self.receive(reader))["type"], "user_left")
+        await self.assert_quiet(reader)
+        self.assertEqual(chatserver.get_database().execute("SELECT count(*) FROM messages").fetchone()[0], 0)
+        chatserver.get_database().execute("PRAGMA query_only = OFF")
+
+    async def test_failed_room_writes_do_not_change_settings_or_membership(self):
+        for create in (True, False):
+            admin = await self.connect_admin_client(f"Owner{create}")
+            room = f"Room{create}"
+            if not create:
+                await self.enter_room(admin, room)
+            chatserver.get_database().execute("PRAGMA query_only = ON")
+            with self.assertLogs(level="ERROR"):
+                if create:
+                    await self.send(admin, {"type": "join_room", "room": room})
+                else:
+                    await self.update_room(admin, room, private=True, background="#000000")
+                self.assertEqual((await self.receive(admin))["type"], "error")
+                await admin.wait_closed()
+            if create:
+                self.assertNotIn(room, chatserver.rooms)
+            else:
+                self.assertEqual(chatserver.rooms[room], chatserver.Room(admin=f"Owner{create}"))
+            chatserver.get_database().execute("PRAGMA query_only = OFF")
 
     async def test_lobby_and_old_admin_client_settings_are_protected(self):
         lobby_user = await self.connect_admin_client("LobbyUser")
@@ -243,7 +346,7 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.receive(modern))["room"], "Lobby")
         self.assertEqual((await self.receive(legacy))["type"], "user_joined")
         rooms = await self.until(modern, "rooms")
-        self.assertEqual(rooms["rooms"], [{"name": "Lobby", "users": 2}])
+        self.assertEqual(rooms["rooms"], [{"name": "Lobby", "users": 2}, {"name": "Pirates", "users": 0}])
         await modern.close()
         self.assertEqual(await self.receive(legacy), {"type": "user_left", "username": "New"})
         await self.assert_quiet(legacy)

@@ -5,7 +5,7 @@ Run `python server\chatserver.py` with the `websockets` package installed, then 
 
 ## Versions
 
-The current release is **1.1.0** (room administration); the first numbered release
+The current release is **1.2.0** (persistent rooms and message history); the first numbered release
 was **1.0.0**. The client version is always visible
 below the connection/chat interface, including when disconnected. It describes
 the loaded client, not the server it connects to. After connection, the server
@@ -23,13 +23,14 @@ rejected based on its version, and existing clients need no changes.
 
 Choose an optional user icon before connecting. The client accepts PNG, JPEG,
 GIF and WebP files up to 2 MiB and uploads a PNG thumbnail at most 64 by 64 pixels.
-Icons are kept in memory for the connection, not saved to disk.
+The uploaded icon is saved with each message so historical messages can display it.
 
 Everyone starts in **Lobby**. After connecting, enter a room name and select
 **Join room** to join or create it. The suggestions show existing rooms and their
 user counts. Each user belongs to one room; messages and join/leave notifications
 are only sent within that room. Switching rooms clears the client's displayed
-messages. There is no message history. Empty rooms disappear except for Lobby.
+messages and loads the last 100 saved messages for the new room.
+Empty rooms remain saved, even when their admin is offline.
 Room names are case-insensitive, trimmed, and limited to 48 characters. The
 server allows up to 32 rooms including Lobby.
 
@@ -45,12 +46,41 @@ Turning off private mode lets everyone join again.
 The background is shared with all administration-aware clients in the room,
 including later arrivals; text contrast adjusts for light/dark backgrounds.
 Lobby has no admin, is always open, and uses the default background.
-When the admin switches rooms or disconnects, their room is deleted and remaining
-members are moved to Lobby with an explanation. Settings are in memory only.
+Rooms, admin names, access lists and backgrounds are saved in the database.
+Starting with 1.2.0, an admin switching rooms or disconnecting no longer closes
+their room. They regain admin rights when reconnecting with the same username
+(case-insensitive). Members can stay in the room while the admin is offline.
 
 **Usernames are not authenticated.** This is name-based access control, not
 secure identity verification: someone could take an allowed name while its user
-is offline. Do not use private rooms to protect sensitive information.
+is offline, including the saved admin name. Do not use private rooms to protect
+sensitive information.
+
+## Database and refresh
+
+The server automatically creates `server\chat.db` using Python's built-in SQLite;
+no database service or extra package is required. The path is relative to the
+server script, not the working directory. Rooms and every accepted message
+(username, text, icon and UTC timestamp) are committed before confirmation or
+broadcast. Database errors are logged and reported to the client, not silently
+treated as successful sends.
+
+All messages are retained, but updated clients receive only the latest **100**
+per room, oldest first. History is loaded after connection and each successful
+room join, including forced moves to Lobby. Private-room access is checked before
+loading its history. Denied joins do not expose that room's messages.
+
+The browser remembers the username, address, port and last confirmed room in
+`sessionStorage` for the current tab. Refresh automatically reconnects, rejoins
+that room if still allowed, and restores history. If rejoining is denied, the
+client stays in Lobby with an error. If the server is unavailable, use **Connect**
+to retry. The selected icon file is not remembered across refresh; select it again
+if needed. Previous messages retain their saved icons. If browser storage is
+unavailable, enter connection details again; server history is still saved.
+
+The database survives server restarts. Back it up while the server is stopped
+and protect it as chat data. It is excluded from Git. Messages sent before this
+feature was installed cannot be recovered.
 
 ## WebSocket protocol and compatibility
 
@@ -114,5 +144,21 @@ receive `room_state`, cannot edit settings, and cannot display custom background
 Their room creator still owns the room; update the client to edit its settings.
 Pre-room clients remain in Lobby. The updated client hides administration controls
 when connecting to older servers.
+
+### History extension (1.2.0)
+
+Clients request `history` in `join.features`. The server acknowledges it in
+`joined.features` and sends this event only to those clients:
+
+```json
+{"type":"history","room":"Lobby","messages":[{"id":1,"username":"Alice","text":"Hello","icon":null,"created_at":"2026-11-03T17:00:00.000Z"}]}
+```
+
+The array contains at most 100 messages from the current room in insertion order.
+It is a snapshot, not additional live messages. Live `message` events retain their
+existing shape. Messages from old clients are saved too, but old clients do not
+receive the new event. The updated client reports when an older server cannot
+restore history. Administration-aware `room_state` also includes the boolean
+`is_admin`, so reconnecting with different username capitalization works correctly.
 
 Run protocol tests with `python -m unittest discover -s server -p "test_*.py"`.

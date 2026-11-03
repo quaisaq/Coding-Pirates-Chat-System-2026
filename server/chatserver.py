@@ -2,13 +2,19 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import re
+import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import websockets
 
 clients = {}
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
+DATABASE_PATH = Path(__file__).with_name("chat.db")
+HISTORY_LIMIT = 100
+database: sqlite3.Connection | None = None
 MAX_USERNAME_LENGTH = 24
 MAX_ROOM_LENGTH = 48
 MAX_ROOMS = 32
@@ -23,6 +29,7 @@ class Client:
     icon: str | None = None
     supports_rooms: bool = False
     supports_room_admin: bool = False
+    supports_history: bool = False
 
 
 @dataclass
@@ -36,6 +43,107 @@ class Room:
 rooms = {LOBBY: Room()}
 
 
+def initialize_database(path=DATABASE_PATH):
+    global database
+    if database is not None:
+        raise RuntimeError("Database is already open.")
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with connection:
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS rooms (
+                    name TEXT PRIMARY KEY,
+                    admin TEXT,
+                    private INTEGER NOT NULL,
+                    allowed_usernames TEXT NOT NULL,
+                    background TEXT NOT NULL
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY,
+                    room TEXT NOT NULL REFERENCES rooms(name),
+                    username TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    icon TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                )
+            """)
+            connection.execute("CREATE INDEX IF NOT EXISTS messages_room_id ON messages(room, id)")
+            connection.execute(
+                "INSERT OR IGNORE INTO rooms VALUES (?, NULL, 0, '[]', '#ffffff')", (LOBBY,),
+            )
+        loaded_rooms = {
+            name: Room(admin, bool(private), json.loads(allowed), background)
+            for name, admin, private, allowed, background in connection.execute(
+                "SELECT name, admin, private, allowed_usernames, background FROM rooms"
+            )
+        }
+    except (sqlite3.Error, ValueError):
+        connection.close()
+        raise
+    database = connection
+    rooms.clear()
+    rooms.update(loaded_rooms)
+
+
+def close_database():
+    global database
+    if database is not None:
+        database.close()
+        database = None
+
+
+def get_database():
+    if database is None:
+        raise RuntimeError("Database has not been initialized.")
+    return database
+
+
+def save_room(name, settings):
+    connection = get_database()
+    with connection:
+        connection.execute("""
+            INSERT INTO rooms VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                admin=excluded.admin, private=excluded.private,
+                allowed_usernames=excluded.allowed_usernames, background=excluded.background
+        """, (name, settings.admin, settings.private, json.dumps(settings.allowed_usernames), settings.background))
+
+
+def save_message(client, text):
+    connection = get_database()
+    with connection:
+        connection.execute(
+            "INSERT INTO messages (room, username, text, icon) VALUES (?, ?, ?, ?)",
+            (client.room, client.username, text, client.icon),
+        )
+
+
+def message_history(room):
+    rows = get_database().execute("""
+        SELECT id, username, text, icon, created_at FROM messages
+        WHERE room = ? ORDER BY id DESC LIMIT ?
+    """, (room, HISTORY_LIMIT)).fetchall()
+    return [
+        {"id": identifier, "username": username, "text": text, "icon": icon, "created_at": created_at}
+        for identifier, username, text, icon, created_at in reversed(rows)
+    ]
+
+
+def notify_history(websocket):
+    client = clients[websocket]
+    if client.supports_history:
+        websockets.broadcast({websocket}, encode_event({
+            "type": "history", "room": client.room, "messages": message_history(client.room),
+        }))
+
+
+def is_admin(client, settings):
+    return settings.admin is not None and settings.admin.casefold() == client.username.casefold()
+
+
 def room_state(client):
     settings = rooms[client.room]
     event = {
@@ -44,8 +152,9 @@ def room_state(client):
         "admin": settings.admin,
         "private": settings.private,
         "background": settings.background,
+        "is_admin": is_admin(client, settings),
     }
-    if settings.admin == client.username:
+    if is_admin(client, settings):
         event["allowed_usernames"] = settings.allowed_usernames
     return event
 
@@ -60,36 +169,24 @@ def may_enter(client, room):
     settings = rooms[room]
     return (
         not settings.private
-        or settings.admin == client.username
+        or is_admin(client, settings)
         or client.username.casefold() in {name.casefold() for name in settings.allowed_usernames}
     )
-
-
-def close_owned_room(room, username):
-    if room == LOBBY or rooms[room].admin != username:
-        return
-    del rooms[room]
-    for websocket, member in list(clients.items()):
-        if member.room == room:
-            move_client(websocket, LOBBY, "Room closed because its admin left.")
 
 
 def move_client(websocket, room, reason=None):
     client = clients[websocket]
     previous_room = client.room
-    # Move first so closing an owned room only relocates the remaining members.
     client.room = room
     event = {"type": "room_joined", "room": room}
     if reason is not None:
         event["reason"] = reason
     websockets.broadcast({websocket}, encode_event(event))
     notify_room_state(websocket)
+    notify_history(websocket)
     if previous_room != room:
         broadcast({"type": "user_left", "username": client.username}, exclude=websocket, room=previous_room)
         broadcast({"type": "user_joined", "username": client.username}, exclude=websocket, room=room)
-        previous_settings = rooms.get(previous_room)
-        if previous_settings is not None and previous_settings.admin == client.username:
-            close_owned_room(previous_room, client.username)
 
 
 def validate_room_settings(event):
@@ -223,6 +320,7 @@ async def handler(websocket):
                     icon=event.get("icon"),
                     supports_rooms=isinstance(features, list) and "rooms" in features,
                     supports_room_admin=isinstance(features, list) and "rooms" in features and "room_admin" in features,
+                    supports_history=isinstance(features, list) and "history" in features,
                 )
                 clients[websocket] = client
                 response = {
@@ -235,8 +333,11 @@ async def handler(websocket):
                         response["features"].append("room_admin")
                 if isinstance(features, list) and "versions" in features:
                     response["server_version"] = SERVER_VERSION
+                if client.supports_history:
+                    response.setdefault("features", []).append("history")
                 await websocket.send(encode_event(response))
                 notify_room_state(websocket)
+                notify_history(websocket)
                 broadcast(
                     {"type": "user_joined", "username": username},
                     exclude=websocket, room=client.room,
@@ -263,7 +364,9 @@ async def handler(websocket):
                     await send_error(websocket, "You are not allowed to enter this private room.")
                     continue
                 if room not in rooms:
-                    rooms[room] = Room(admin=username)
+                    settings = Room(admin=username)
+                    save_room(room, settings)
+                    rooms[room] = settings
                 previous_room = client.room
                 move_client(websocket, room)
                 if previous_room != room:
@@ -274,7 +377,7 @@ async def handler(websocket):
                 settings = rooms[client.room]
                 if (
                     not client.supports_room_admin
-                    or settings.admin != username
+                    or not is_admin(client, settings)
                     or event.get("room") != client.room
                 ):
                     await send_error(websocket, "Only the room admin can change its settings.")
@@ -284,9 +387,9 @@ async def handler(websocket):
                 except ValueError as error:
                     await send_error(websocket, str(error))
                     continue
-                settings.private = private
-                settings.allowed_usernames = allowed
-                settings.background = background
+                updated_settings = Room(settings.admin, private, allowed, background)
+                save_room(client.room, updated_settings)
+                rooms[client.room] = updated_settings
                 for member_socket, member in list(clients.items()):
                     if member.room == client.room:
                         if not may_enter(member, client.room):
@@ -311,6 +414,7 @@ async def handler(websocket):
                 }))
                 continue
 
+            save_message(client, text)
             broadcast({
                 "type": "message",
                 "username": username,
@@ -318,10 +422,13 @@ async def handler(websocket):
                 "room": client.room,
                 "icon": client.icon,
             }, room=client.room)
+    except sqlite3.Error:
+        logging.exception("Chat database operation failed")
+        await send_error(websocket, "Database operation failed. Reconnect and retry; the operation was not confirmed.")
+        await websocket.close(code=1011, reason="Database operation failed")
     finally:
         disconnected_client = clients.pop(websocket, None)
         if disconnected_client is not None:
-            close_owned_room(disconnected_client.room, disconnected_client.username)
             broadcast(
                 {"type": "user_left", "username": disconnected_client.username},
                 room=disconnected_client.room,
@@ -330,9 +437,14 @@ async def handler(websocket):
 
 
 async def main():
-    async with websockets.serve(handler, "0.0.0.0", 12345, max_size=None):
-        print(f"Chat server v{SERVER_VERSION} running on ws://0.0.0.0:12345")
-        await asyncio.Future()
+    initialize_database()
+    try:
+        async with websockets.serve(handler, "0.0.0.0", 12345, max_size=None):
+            print(f"Chat server v{SERVER_VERSION} running on ws://0.0.0.0:12345")
+            print(f"Database: {DATABASE_PATH}")
+            await asyncio.Future()
+    finally:
+        close_database()
 
 if __name__ == "__main__":
     asyncio.run(main())

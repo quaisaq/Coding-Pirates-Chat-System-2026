@@ -106,7 +106,7 @@
                 <p><label for="allowedUsernames">Allowed usernames (one per line, up to 100)</label></p>
                 <textarea id="allowedUsernames" rows="4"></textarea>
                 <p>The admin always has access. Removed users are moved to Lobby.
-                    The room closes when its admin leaves.</p>
+                    The room and its settings remain saved when the admin is offline.</p>
                 <label for="backgroundColor">Room background color</label>
                 <input id="backgroundColor" type="color" value="#ffffff">
                 <button type="submit">Save room settings</button>
@@ -124,7 +124,7 @@
     <p id="serverVersion" hidden></p>
 
     <script>
-        const CLIENT_VERSION = "1.1.0";
+        const CLIENT_VERSION = "1.2.0";
         let socket;
         let username;
         let joined = false;
@@ -133,6 +133,9 @@
         let supportsRoomAdmin = false;
         let isRoomAdmin = false;
         let savingSettings = false;
+        let supportsHistory = false;
+        let resumeRoom = null;
+        let connectionSettings = null;
 
         const connectDiv = document.getElementById("connect");
         const chatDiv = document.getElementById("chat");
@@ -153,6 +156,16 @@
         const backgroundColor = document.getElementById("backgroundColor");
 
         document.getElementById("clientVersion").textContent = `Client version: ${CLIENT_VERSION}`;
+
+        function rememberConnection() {
+            if (!connectionSettings) return;
+            try {
+                sessionStorage.setItem("chatConnection", JSON.stringify({...connectionSettings, room}));
+            } catch (error) {
+                if (!(error instanceof DOMException)) throw error;
+                addMessage("Could not remember this connection for refresh.", "system");
+            }
+        }
 
         function resetRoomSettings() {
             adminForm.hidden = true;
@@ -180,7 +193,7 @@
             document.body.style.color = foreground;
             document.body.style.setProperty("--mine-color", foreground);
             document.body.style.setProperty("--system-color", foreground);
-            isRoomAdmin = data.admin === username;
+            isRoomAdmin = typeof data.is_admin === "boolean" ? data.is_admin : data.admin === username;
             adminForm.hidden = !isRoomAdmin;
             roomInfo.textContent = data.admin
                 ? `Admin: ${data.admin}${isRoomAdmin ? " (you)" : ""} | ${data.private ? "Private" : "Open"} room`
@@ -251,6 +264,8 @@
             statusText.textContent = "Connecting...";
             connectButton.disabled = true;
             joined = false;
+            supportsHistory = false;
+            connectionSettings = {username, ip, port};
             resetRoomSettings();
             supportsRoomAdmin = false;
             serverVersion.hidden = true;
@@ -278,7 +293,7 @@
             socket.onopen = () => {
                 socket.send(JSON.stringify({
                     type: "join", username, icon,
-                    features: ["rooms", "icons", "versions", "room_admin"],
+                    features: ["rooms", "icons", "versions", "room_admin", "history"],
                     client_version: CLIENT_VERSION,
                 }));
             };
@@ -303,6 +318,7 @@
                         connectDiv.hidden = true;
                         chatDiv.hidden = false;
                         room = data.room || null;
+                        supportsHistory = Array.isArray(data.features) && data.features.includes("history");
                         resetRoomSettings();
                         supportsRoomAdmin = Array.isArray(data.features) && data.features.includes("room_admin");
                         if (room && !supportsRoomAdmin) {
@@ -311,10 +327,20 @@
                         roomForm.hidden = !Array.isArray(data.features) || !data.features.includes("rooms");
                         currentRoom.textContent = room ? `Room: ${room}` : "This server does not support rooms.";
                         addMessage(`Connected as ${data.username}.`, "system");
+                        if (!supportsHistory) {
+                            addMessage("This server does not support saved message history.", "system");
+                        }
                         if (icon && (!Array.isArray(data.features) || !data.features.includes("icons"))) {
                             addMessage("This server does not support user icons.", "system");
                         }
                         messageInput.focus();
+                        if (resumeRoom && resumeRoom !== room && !roomForm.hidden) {
+                            changingRoom = true;
+                            socket.send(JSON.stringify({type: "join_room", room: resumeRoom}));
+                        } else {
+                            rememberConnection();
+                        }
+                        resumeRoom = null;
                         break;
                     case "rooms":
                         roomList.replaceChildren();
@@ -330,6 +356,7 @@
                         resetRoomSettings();
                         room = data.room;
                         roomName.value = room;
+                        rememberConnection();
                         changingRoom = false;
                         currentRoom.textContent = `Room: ${room}`;
                         if (!supportsRoomAdmin) {
@@ -342,6 +369,21 @@
                     case "room_state":
                         applyRoomState(data);
                         break;
+                    case "history":
+                        if (!supportsHistory || data.room !== room) break;
+                        if (!Array.isArray(data.messages)) {
+                            addMessage("Received invalid message history from the server.", "system");
+                            break;
+                        }
+                        for (const item of messages.querySelectorAll("li:not(.system), li[data-history-status]")) {
+                            item.remove();
+                        }
+                        addMessage(`Loaded ${data.messages.length} saved messages from ${room}.`, "system");
+                        messages.lastElementChild.dataset.historyStatus = "";
+                        for (const entry of data.messages) {
+                            addMessage(`${entry.username}: ${entry.text}`, entry.username === username ? "mine" : "", entry.icon);
+                        }
+                        break;
                     case "user_joined":
                         addMessage(`${data.username} joined the chat.`, "system");
                         break;
@@ -353,6 +395,7 @@
                         break;
                     case "error":
                         changingRoom = false;
+                        rememberConnection();
                         if (savingSettings) adminStatus.textContent = data.message;
                         savingSettings = false;
                         statusText.textContent = data.message;
@@ -426,6 +469,26 @@
             socket.send(JSON.stringify({ type: "message", text }));
             messageInput.value = "";
         });
+
+        try {
+            const saved = sessionStorage.getItem("chatConnection");
+            if (saved) {
+                const settings = JSON.parse(saved);
+                if (settings && typeof settings.username === "string" &&
+                    typeof settings.ip === "string" && typeof settings.port === "string") {
+                    document.getElementById("username").value = settings.username;
+                    document.getElementById("ip").value = settings.ip;
+                    document.getElementById("port").value = settings.port;
+                    resumeRoom = typeof settings.room === "string" ? settings.room : null;
+                    connectButton.click();
+                } else {
+                    statusText.textContent = "Saved connection is invalid. Enter your connection details again.";
+                }
+            }
+        } catch (error) {
+            if (!(error instanceof DOMException) && !(error instanceof SyntaxError)) throw error;
+            statusText.textContent = "Could not restore the saved connection. Enter your connection details again.";
+        }
     </script>
 </body>
 </html>
