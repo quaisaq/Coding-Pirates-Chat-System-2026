@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import websockets
 
 clients = {}
+SERVER_VERSION = "1.0.0"
 MAX_USERNAME_LENGTH = 24
 MAX_ROOM_LENGTH = 48
 MAX_ROOMS = 32
@@ -142,6 +143,8 @@ async def handler(websocket):
                 }
                 if client.supports_rooms:
                     response.update({"room": client.room, "features": ["rooms", "icons"]})
+                if isinstance(features, list) and "versions" in features:
+                    response["server_version"] = SERVER_VERSION
                 await websocket.send(encode_event(response))
                 broadcast(
                     {"type": "user_joined", "username": username},
@@ -214,7 +217,7 @@ async def handler(websocket):
 
 async def main():
     async with websockets.serve(handler, "0.0.0.0", 12345, max_size=None):
-        print("Chat server running on ws://0.0.0.0:12345")
+        print(f"Chat server v{SERVER_VERSION} running on ws://0.0.0.0:12345")
         await asyncio.Future()
 
 if __name__ == "__main__":

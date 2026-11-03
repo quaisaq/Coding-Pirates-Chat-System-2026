@@ -3,6 +3,23 @@
 Run `python server\chatserver.py` with the `websockets` package installed, then open
 `client\chat.html` and enter the server address and port (default: 12345).
 
+## Versions
+
+The first numbered release is **1.0.0**. The client version is always visible
+below the connection/chat interface, including when disconnected. It describes
+the loaded client, not the server it connects to. After connection, the server
+version is shown separately; older servers are explicitly shown as unknown.
+
+Use `MAJOR.MINOR.PATCH`: major for incompatible changes, minor for new compatible
+features, and patch for fixes. Update `CLIENT_VERSION` in `client\chat.html` and
+`SERVER_VERSION` in `server\chatserver.py` when releasing changes to each component.
+Reload the client or restart the server to load a new version.
+
+Version-aware clients add `"versions"` to `features` and send the optional
+`client_version` string in `join`. The server adds `server_version` to `joined`
+only when `"versions"` was requested. Versions are informational; no client is
+rejected based on its version, and existing clients need no changes.
+
 Choose an optional user icon before connecting. The client accepts PNG, JPEG,
 GIF and WebP files up to 2 MiB and uploads a PNG thumbnail at most 64 by 64 pixels.
 Icons are kept in memory for the connection, not saved to disk.

@@ -49,6 +49,18 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(connection.recv(), timeout=0.05)
 
+    async def test_version_handshake_is_optional(self):
+        connection, response = await self.connect(
+            "Versioned", features=["rooms", "icons", "versions"], client_version="1.0.0",
+        )
+        self.assertEqual(response["server_version"], chatserver.SERVER_VERSION)
+        self.assertEqual(response["room"], "Lobby")
+        await self.until(connection, "rooms")
+        await self.send(connection, {"type": "message", "text": "Versioned chat"})
+        self.assertEqual((await self.receive(connection))["text"], "Versioned chat")
+        _, response = await self.connect("Unversioned", modern=True)
+        self.assertNotIn("server_version", response)
+
     async def test_legacy_protocol_and_room_isolation(self):
         legacy, joined = await self.connect("Old")
         self.assertEqual(joined, {"type": "joined", "username": "Old"})

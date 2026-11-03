@@ -96,7 +96,11 @@
         </form>
     </div>
 
+    <p id="clientVersion"></p>
+    <p id="serverVersion" hidden></p>
+
     <script>
+        const CLIENT_VERSION = "1.0.0";
         let socket;
         let username;
         let joined = false;
@@ -113,6 +117,9 @@
         const roomName = document.getElementById("roomName");
         const currentRoom = document.getElementById("currentRoom");
         const roomList = document.getElementById("roomList");
+        const serverVersion = document.getElementById("serverVersion");
+
+        document.getElementById("clientVersion").textContent = `Client version: ${CLIENT_VERSION}`;
 
         function addMessage(text, cssClass, icon) {
             const li = document.createElement("li");
@@ -171,6 +178,8 @@
             statusText.textContent = "Connecting...";
             connectButton.disabled = true;
             joined = false;
+            serverVersion.hidden = true;
+            serverVersion.textContent = "";
             room = null;
             changingRoom = false;
 
@@ -192,7 +201,11 @@
             }
 
             socket.onopen = () => {
-                socket.send(JSON.stringify({ type: "join", username, icon, features: ["rooms", "icons"] }));
+                socket.send(JSON.stringify({
+                    type: "join", username, icon,
+                    features: ["rooms", "icons", "versions"],
+                    client_version: CLIENT_VERSION,
+                }));
             };
 
             socket.onmessage = (event) => {
@@ -207,6 +220,10 @@
                 switch (data.type) {
                     case "joined":
                         joined = true;
+                        serverVersion.textContent = typeof data.server_version === "string"
+                            ? `Server version: ${data.server_version}`
+                            : "Server version: unknown (not provided by this server)";
+                        serverVersion.hidden = false;
                         messages.replaceChildren();
                         connectDiv.hidden = true;
                         chatDiv.hidden = false;
@@ -263,6 +280,8 @@
             socket.onclose = () => {
                 if (joined) addMessage("Disconnected", "system");
                 joined = false;
+                serverVersion.hidden = true;
+                serverVersion.textContent = "";
                 changingRoom = false;
                 roomForm.hidden = true;
                 connectDiv.hidden = false;
