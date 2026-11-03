@@ -37,11 +37,11 @@
 
         #messages li.mine {
             text-align: right;
-            color: #0066cc;
+            color: var(--mine-color, #0066cc);
         }
 
         #messages li.system {
-            color: #888;
+            color: var(--system-color, #888);
             font-style: italic;
         }
 
@@ -68,6 +68,15 @@
         #roomForm[hidden] {
             display: none;
         }
+
+        textarea {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        input[type="checkbox"] {
+            width: auto;
+        }
     </style>
 </head>
 <body>
@@ -89,6 +98,21 @@
             <datalist id="roomList"></datalist>
             <button type="submit">Join room</button>
         </form>
+        <p id="roomInfo"></p>
+        <form id="adminForm" hidden>
+            <fieldset>
+                <legend>Room administration</legend>
+                <label><input id="privateRoom" type="checkbox"> Private room (only allowed usernames)</label>
+                <p><label for="allowedUsernames">Allowed usernames (one per line, up to 100)</label></p>
+                <textarea id="allowedUsernames" rows="4"></textarea>
+                <p>The admin always has access. Removed users are moved to Lobby.
+                    The room closes when its admin leaves.</p>
+                <label for="backgroundColor">Room background color</label>
+                <input id="backgroundColor" type="color" value="#ffffff">
+                <button type="submit">Save room settings</button>
+                <p id="adminStatus" role="status"></p>
+            </fieldset>
+        </form>
         <ul id="messages" aria-live="polite"></ul>
         <form id="sendForm">
             <input id="message" placeholder="Type a message..." autocomplete="off">
@@ -100,12 +124,15 @@
     <p id="serverVersion" hidden></p>
 
     <script>
-        const CLIENT_VERSION = "1.0.0";
+        const CLIENT_VERSION = "1.1.0";
         let socket;
         let username;
         let joined = false;
         let room = null;
         let changingRoom = false;
+        let supportsRoomAdmin = false;
+        let isRoomAdmin = false;
+        let savingSettings = false;
 
         const connectDiv = document.getElementById("connect");
         const chatDiv = document.getElementById("chat");
@@ -118,8 +145,54 @@
         const currentRoom = document.getElementById("currentRoom");
         const roomList = document.getElementById("roomList");
         const serverVersion = document.getElementById("serverVersion");
+        const adminForm = document.getElementById("adminForm");
+        const roomInfo = document.getElementById("roomInfo");
+        const adminStatus = document.getElementById("adminStatus");
+        const privateRoom = document.getElementById("privateRoom");
+        const allowedUsernames = document.getElementById("allowedUsernames");
+        const backgroundColor = document.getElementById("backgroundColor");
 
         document.getElementById("clientVersion").textContent = `Client version: ${CLIENT_VERSION}`;
+
+        function resetRoomSettings() {
+            adminForm.hidden = true;
+            isRoomAdmin = false;
+            savingSettings = false;
+            roomInfo.textContent = "";
+            adminStatus.textContent = "";
+            document.body.style.backgroundColor = "";
+            document.body.style.color = "";
+            document.body.style.removeProperty("--mine-color");
+            document.body.style.removeProperty("--system-color");
+        }
+
+        function applyRoomState(data) {
+            if (data.room !== room || !supportsRoomAdmin) return;
+            if (typeof data.background !== "string" || !/^#[0-9a-fA-F]{6}$/.test(data.background)) {
+                addMessage("Received an invalid room background from the server.", "system");
+                return;
+            }
+            const rgb = data.background.slice(1).match(/../g).map(value => parseInt(value, 16) / 255);
+            const linear = rgb.map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+            const luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+            const foreground = luminance > 0.179 ? "#000000" : "#ffffff";
+            document.body.style.backgroundColor = data.background;
+            document.body.style.color = foreground;
+            document.body.style.setProperty("--mine-color", foreground);
+            document.body.style.setProperty("--system-color", foreground);
+            isRoomAdmin = data.admin === username;
+            adminForm.hidden = !isRoomAdmin;
+            roomInfo.textContent = data.admin
+                ? `Admin: ${data.admin}${isRoomAdmin ? " (you)" : ""} | ${data.private ? "Private" : "Open"} room`
+                : "Lobby is open to everyone and has no admin.";
+            if (isRoomAdmin) {
+                privateRoom.checked = data.private;
+                allowedUsernames.value = data.allowed_usernames.join("\n");
+                backgroundColor.value = data.background;
+                adminStatus.textContent = savingSettings ? "Room settings saved." : "";
+            }
+            savingSettings = false;
+        }
 
         function addMessage(text, cssClass, icon) {
             const li = document.createElement("li");
@@ -178,6 +251,8 @@
             statusText.textContent = "Connecting...";
             connectButton.disabled = true;
             joined = false;
+            resetRoomSettings();
+            supportsRoomAdmin = false;
             serverVersion.hidden = true;
             serverVersion.textContent = "";
             room = null;
@@ -203,7 +278,7 @@
             socket.onopen = () => {
                 socket.send(JSON.stringify({
                     type: "join", username, icon,
-                    features: ["rooms", "icons", "versions"],
+                    features: ["rooms", "icons", "versions", "room_admin"],
                     client_version: CLIENT_VERSION,
                 }));
             };
@@ -228,6 +303,11 @@
                         connectDiv.hidden = true;
                         chatDiv.hidden = false;
                         room = data.room || null;
+                        resetRoomSettings();
+                        supportsRoomAdmin = Array.isArray(data.features) && data.features.includes("room_admin");
+                        if (room && !supportsRoomAdmin) {
+                            roomInfo.textContent = "This server does not support room administration.";
+                        }
                         roomForm.hidden = !Array.isArray(data.features) || !data.features.includes("rooms");
                         currentRoom.textContent = room ? `Room: ${room}` : "This server does not support rooms.";
                         addMessage(`Connected as ${data.username}.`, "system");
@@ -247,12 +327,20 @@
                         break;
                     case "room_joined":
                         if (room !== data.room) messages.replaceChildren();
+                        resetRoomSettings();
                         room = data.room;
                         roomName.value = room;
                         changingRoom = false;
                         currentRoom.textContent = `Room: ${room}`;
+                        if (!supportsRoomAdmin) {
+                            roomInfo.textContent = "This server does not support room administration.";
+                        }
                         addMessage(`Joined room ${room}.`, "system");
+                        if (data.reason) addMessage(data.reason, "system");
                         messageInput.focus();
+                        break;
+                    case "room_state":
+                        applyRoomState(data);
                         break;
                     case "user_joined":
                         addMessage(`${data.username} joined the chat.`, "system");
@@ -265,6 +353,8 @@
                         break;
                     case "error":
                         changingRoom = false;
+                        if (savingSettings) adminStatus.textContent = data.message;
+                        savingSettings = false;
                         statusText.textContent = data.message;
                         addMessage(data.message, "system");
                         break;
@@ -280,6 +370,8 @@
             socket.onclose = () => {
                 if (joined) addMessage("Disconnected", "system");
                 joined = false;
+                resetRoomSettings();
+                supportsRoomAdmin = false;
                 serverVersion.hidden = true;
                 serverVersion.textContent = "";
                 changingRoom = false;
@@ -300,6 +392,26 @@
             }
             changingRoom = true;
             socket.send(JSON.stringify({ type: "join_room", room: requestedRoom }));
+        });
+
+        adminForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+            if (!joined || !isRoomAdmin || socket.readyState !== WebSocket.OPEN) return;
+            if (changingRoom || savingSettings) {
+                adminStatus.textContent = "Wait for the pending change to be confirmed.";
+                return;
+            }
+            const allowed = allowedUsernames.value.split(/\r?\n/).map(name => name.trim()).filter(Boolean);
+            if (allowed.length > 100 || allowed.some(name => name.length > 24)) {
+                adminStatus.textContent = "Provide up to 100 usernames with 1 to 24 characters each.";
+                return;
+            }
+            savingSettings = true;
+            adminStatus.textContent = "Saving...";
+            socket.send(JSON.stringify({
+                type: "update_room", room, private: privateRoom.checked,
+                allowed_usernames: allowed, background: backgroundColor.value,
+            }));
         });
 
         document.getElementById("sendForm").addEventListener("submit", (event) => {

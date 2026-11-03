@@ -5,7 +5,8 @@ Run `python server\chatserver.py` with the `websockets` package installed, then 
 
 ## Versions
 
-The first numbered release is **1.0.0**. The client version is always visible
+The current release is **1.1.0** (room administration); the first numbered release
+was **1.0.0**. The client version is always visible
 below the connection/chat interface, including when disconnected. It describes
 the loaded client, not the server it connects to. After connection, the server
 version is shown separately; older servers are explicitly shown as unknown.
@@ -31,6 +32,25 @@ are only sent within that room. Switching rooms clears the client's displayed
 messages. There is no message history. Empty rooms disappear except for Lobby.
 Room names are case-insensitive, trimmed, and limited to 48 characters. The
 server allows up to 32 rooms including Lobby.
+
+## Room administration
+
+The user who creates a room is its admin. New rooms are open. The admin can
+enable **Private room**, enter allowed usernames (one per line, up to 100), and
+choose a background color, then select **Save room settings**. Names are trimmed
+and compared case-insensitively; the admin always retains access. Switching to
+private mode or removing a name immediately moves unauthorized members to Lobby.
+Turning off private mode lets everyone join again.
+
+The background is shared with all administration-aware clients in the room,
+including later arrivals; text contrast adjusts for light/dark backgrounds.
+Lobby has no admin, is always open, and uses the default background.
+When the admin switches rooms or disconnects, their room is deleted and remaining
+members are moved to Lobby with an explanation. Settings are in memory only.
+
+**Usernames are not authenticated.** This is name-based access control, not
+secure identity verification: someone could take an allowed name while its user
+is offline. Do not use private rooms to protect sensitive information.
 
 ## WebSocket protocol and compatibility
 
@@ -65,5 +85,34 @@ current room. Received messages include the original `username` and `text`, plus
 The updated browser client also works with the original server: if `joined`
 does not advertise capabilities, room controls are hidden and icon support is
 reported as unavailable.
+
+### Administration extension (1.1.0)
+
+Clients advertise both `rooms` and `room_admin` in `join.features`. The server
+adds `room_admin` to `joined.features` only for clients requesting it. These
+clients receive `room_state` after joining and whenever settings change:
+
+```json
+{"type":"room_state","room":"Games","admin":"Alice","private":true,"background":"#123abc"}
+```
+
+Only the admin also receives `allowed_usernames`. To update the current room,
+an administration-aware admin sends all settings together:
+
+```json
+{"type":"update_room","room":"Games","private":true,"allowed_usernames":["Bob"],"background":"#123abc"}
+```
+
+The server checks admin rights, the current room, boolean privacy, up to 100
+usernames of 1–24 characters, and a six-digit hex color. Invalid updates return
+`error` without modifying settings; a successful update is confirmed by
+`room_state`. Denied room joins likewise leave membership unchanged.
+
+Forced moves use the existing `room_joined` event with `room: "Lobby"` and an
+optional `reason`. Old room-aware clients still relocate correctly, but do not
+receive `room_state`, cannot edit settings, and cannot display custom backgrounds.
+Their room creator still owns the room; update the client to edit its settings.
+Pre-room clients remain in Lobby. The updated client hides administration controls
+when connecting to older servers.
 
 Run protocol tests with `python -m unittest discover -s server -p "test_*.py"`.

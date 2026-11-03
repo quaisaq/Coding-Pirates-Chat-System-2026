@@ -49,6 +49,156 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(connection.recv(), timeout=0.05)
 
+    async def connect_admin_client(self, username):
+        connection, joined = await self.connect(
+            username, features=["rooms", "icons", "versions", "room_admin"],
+        )
+        self.assertIn("room_admin", joined["features"])
+        await self.until(connection, "room_state")
+        await self.until(connection, "rooms")
+        return connection
+
+    async def enter_room(self, connection, room):
+        await self.send(connection, {"type": "join_room", "room": room})
+        await self.until(connection, "room_joined")
+        state = await self.until(connection, "room_state")
+        await self.until(connection, "rooms")
+        return state
+
+    async def update_room(self, connection, room, **extra):
+        await self.send(connection, {
+            "type": "update_room", "room": room, "private": False,
+            "allowed_usernames": [], "background": "#ffffff", **extra,
+        })
+
+    async def test_admin_access_list_revocation_and_background(self):
+        admin = await self.connect_admin_client("Owner")
+        state = await self.enter_room(admin, "Managed")
+        self.assertEqual(state["admin"], "Owner")
+        self.assertFalse(state["private"])
+        self.assertEqual(state["allowed_usernames"], [])
+        guest = await self.connect_admin_client("Guest")
+        state = await self.enter_room(guest, "Managed")
+        self.assertNotIn("allowed_usernames", state)
+        outsider = await self.connect_admin_client("Outsider")
+
+        await self.update_room(
+            admin, "Managed", private=True,
+            allowed_usernames=[" guest ", "GUEST", "Future"], background="#123ABC",
+        )
+        state = await self.until(admin, "room_state")
+        self.assertEqual(state["background"], "#123abc")
+        self.assertEqual(state["allowed_usernames"], ["GUEST", "Future"])
+        state = await self.until(guest, "room_state")
+        self.assertTrue(state["private"])
+        self.assertEqual(state["background"], "#123abc")
+        self.assertNotIn("allowed_usernames", state)
+        await self.until(guest, "rooms")
+        await self.until(outsider, "rooms")
+        await self.send(outsider, {"type": "join_room", "room": "managed"})
+        self.assertEqual((await self.receive(outsider))["type"], "error")
+        await self.send(outsider, {"type": "message", "text": "Denied remains in Lobby"})
+        self.assertEqual((await self.receive(outsider))["room"], "Lobby")
+
+        future = await self.connect_admin_client("future")
+        state = await self.enter_room(future, "Managed")
+        self.assertEqual(state["background"], "#123abc")
+        self.assertTrue(state["private"])
+        self.assertNotIn("allowed_usernames", state)
+        await future.close()
+        self.assertIn("Managed", chatserver.rooms)
+
+        await self.update_room(admin, "Managed", private=True, allowed_usernames=[])
+        await self.until(admin, "room_state")
+        event = await self.until(guest, "room_joined")
+        self.assertEqual(event["room"], "Lobby")
+        self.assertIn("removed", event["reason"])
+        self.assertIsNone((await self.until(guest, "room_state"))["admin"])
+        await self.until(guest, "rooms")
+        await self.send(guest, {"type": "join_room", "room": "Managed"})
+        self.assertEqual((await self.receive(guest))["type"], "error")
+        await self.update_room(admin, "Managed", private=False, background="#000000")
+        await self.until(admin, "room_state")
+        await self.until(guest, "rooms")
+        state = await self.enter_room(guest, "Managed")
+        self.assertEqual(state["background"], "#000000")
+        self.assertFalse(state["private"])
+
+    async def test_room_settings_authorization_and_atomic_validation(self):
+        admin = await self.connect_admin_client("Owner")
+        await self.enter_room(admin, "Managed")
+        guest = await self.connect_admin_client("Guest")
+        await self.enter_room(guest, "Managed")
+        await self.update_room(guest, "Managed", background="#000000", admin="Guest")
+        self.assertEqual((await self.receive(guest))["type"], "error")
+        await self.update_room(admin, "Lobby")
+        self.assertEqual((await self.until(admin, "error"))["type"], "error")
+        invalid = [
+            {"private": "true"}, {"allowed_usernames": "Guest"},
+            {"allowed_usernames": [""]}, {"allowed_usernames": [42]},
+            {"allowed_usernames": ["x" * 25]}, {"allowed_usernames": ["Guest"] * 101},
+            {"background": "url(https://example.com)"}, {"background": "#fff"},
+        ]
+        for change in invalid:
+            await self.update_room(admin, "Managed", **change)
+            self.assertEqual((await self.receive(admin))["type"], "error")
+            settings = chatserver.rooms["Managed"]
+            self.assertEqual(settings.admin, "Owner")
+            self.assertFalse(settings.private)
+            self.assertEqual(settings.background, "#ffffff")
+            self.assertEqual(settings.allowed_usernames, [])
+        await self.update_room(admin, "Managed", allowed_usernames=[f"Name{i}" for i in range(100)])
+        self.assertEqual(len((await self.until(admin, "room_state"))["allowed_usernames"]), 100)
+
+    async def test_admin_departure_closes_room_and_moves_old_room_clients(self):
+        for mode in ("switch", "disconnect"):
+            admin = await self.connect_admin_client(f"Owner{mode}")
+            await self.enter_room(admin, "Managed")
+            guest = await self.connect_admin_client(f"Guest{mode}")
+            await self.enter_room(guest, "Managed")
+            old_client, _ = await self.connect(f"Old{mode}", modern=True)
+            await self.until(old_client, "rooms")
+            await self.send(old_client, {"type": "join_room", "room": "Managed"})
+            await self.until(old_client, "room_joined")
+            await self.until(old_client, "rooms")
+            await self.until(guest, "user_joined")
+            await self.until(guest, "rooms")
+            if mode == "switch":
+                await self.send(admin, {"type": "join_room", "room": "Lobby"})
+                await self.until(admin, "room_joined")
+            else:
+                await admin.close()
+            event = await self.until(guest, "room_joined")
+            self.assertEqual(event["room"], "Lobby")
+            self.assertIn("admin left", event["reason"])
+            self.assertIsNone((await self.until(guest, "room_state"))["admin"])
+            await self.until(guest, "rooms")
+            event = await self.until(old_client, "room_joined")
+            self.assertEqual(event["room"], "Lobby")
+            await self.until(old_client, "rooms")
+            self.assertNotIn("Managed", chatserver.rooms)
+            await self.send(old_client, {"type": "message", "text": "Relocated"})
+            self.assertEqual((await self.receive(old_client))["room"], "Lobby")
+            self.assertEqual((await self.until(guest, "message"))["room"], "Lobby")
+            await guest.close()
+            await old_client.close()
+            await admin.close()
+
+    async def test_lobby_and_old_admin_client_settings_are_protected(self):
+        lobby_user = await self.connect_admin_client("LobbyUser")
+        await self.update_room(lobby_user, "Lobby")
+        self.assertEqual((await self.receive(lobby_user))["type"], "error")
+        old, joined = await self.connect("OldAdmin", modern=True)
+        self.assertNotIn("room_admin", joined["features"])
+        await self.until(old, "rooms")
+        await self.send(old, {"type": "join_room", "room": "OldRoom"})
+        await self.until(old, "room_joined")
+        await self.until(old, "rooms")
+        self.assertEqual(chatserver.rooms["OldRoom"].admin, "OldAdmin")
+        await self.update_room(old, "OldRoom", private=True)
+        self.assertEqual((await self.receive(old))["type"], "error")
+        await self.assert_quiet(old)
+
     async def test_version_handshake_is_optional(self):
         connection, response = await self.connect(
             "Versioned", features=["rooms", "icons", "versions"], client_version="1.0.0",
