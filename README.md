@@ -5,7 +5,7 @@ Run `python server\chatserver.py` with the `websockets` package installed, then 
 
 ## Versions
 
-The current client release is **1.3.0** (image URL previews); the server remains
+The current client release is **1.3.1** (collapsible administration settings); the server remains
 **1.2.0** because the protocol and server behavior are unchanged. The first numbered release
 was **1.0.0**. The client version is always visible
 below the connection/chat interface, including when disconnected. It describes
@@ -43,6 +43,11 @@ choose a background color, then select **Save room settings**. Names are trimmed
 and compared case-insensitively; the admin always retains access. Switching to
 private mode or removing a name immediately moves unauthorized members to Lobby.
 Turning off private mode lets everyone join again.
+
+Admin settings are collapsed by default to leave more space for chat. Select
+**Room administration** to expand or collapse them (also accessible with the
+keyboard). Collapsing preserves unsaved input. Switching rooms or reconnecting
+collapses the panel again; saving settings leaves it open.
 
 The background is shared with all administration-aware clients in the room,
 including later arrivals; text contrast adjusts for light/dark backgrounds.
