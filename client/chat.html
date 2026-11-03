@@ -77,6 +77,25 @@
         input[type="checkbox"] {
             width: auto;
         }
+
+        .message-image {
+            display: block;
+            max-width: 100%;
+            max-height: 240px;
+            width: auto;
+            height: auto;
+            margin-top: 8px;
+        }
+
+        .mine .message-image {
+            margin-left: auto;
+        }
+
+        .image-error {
+            display: block;
+            margin-top: 8px;
+            font-size: 0.9em;
+        }
     </style>
 </head>
 <body>
@@ -124,7 +143,7 @@
     <p id="serverVersion" hidden></p>
 
     <script>
-        const CLIENT_VERSION = "1.2.0";
+        const CLIENT_VERSION = "1.3.0";
         let socket;
         let username;
         let joined = false;
@@ -207,6 +226,32 @@
             savingSettings = false;
         }
 
+        function imageUrls(text) {
+            const urls = new Set();
+            for (const match of text.matchAll(/https?:\/\/[^\s<>"']+/gi)) {
+                let candidate = match[0].replace(/[.,!?;:]+$/, "");
+                for (const [open, close] of [["(", ")"], ["[", "]"], ["{", "}"]]) {
+                    while (candidate.endsWith(close) &&
+                        candidate.split(close).length > candidate.split(open).length) {
+                        candidate = candidate.slice(0, -1);
+                    }
+                }
+                let url;
+                try {
+                    url = new URL(candidate);
+                } catch (error) {
+                    if (!(error instanceof TypeError)) throw error;
+                    continue;
+                }
+                if (url.username || url.password) continue;
+                if (/\.(png|jpe?g|gif|webp|avif|bmp|svg|ico)$/i.test(url.pathname) ||
+                    /^(png|jpe?g|gif|webp|avif|bmp|svg|ico)$/i.test(url.searchParams.get("format") || "")) {
+                    urls.add(url.href);
+                }
+            }
+            return urls;
+        }
+
         function addMessage(text, cssClass, icon) {
             const li = document.createElement("li");
             if (typeof icon === "string" && icon.length <= 87416 &&
@@ -219,6 +264,26 @@
             }
             li.appendChild(document.createTextNode(text));
             if (cssClass) li.className = cssClass;
+            if (cssClass !== "system") {
+                for (const url of imageUrls(text)) {
+                    const image = document.createElement("img");
+                    image.className = "message-image";
+                    image.alt = `Image from ${url}`;
+                    image.loading = "lazy";
+                    image.referrerPolicy = "no-referrer";
+                    image.addEventListener("load", () => {
+                        if (li === messages.lastElementChild) messages.scrollTop = messages.scrollHeight;
+                    });
+                    image.addEventListener("error", () => {
+                        const error = document.createElement("span");
+                        error.className = "image-error";
+                        error.textContent = `Could not load image: ${url}`;
+                        image.replaceWith(error);
+                    }, {once: true});
+                    image.src = url;
+                    li.appendChild(image);
+                }
+            }
             messages.appendChild(li);
             messages.scrollTop = messages.scrollHeight;
         }

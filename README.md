@@ -5,7 +5,8 @@ Run `python server\chatserver.py` with the `websockets` package installed, then 
 
 ## Versions
 
-The current release is **1.2.0** (persistent rooms and message history); the first numbered release
+The current client release is **1.3.0** (image URL previews); the server remains
+**1.2.0** because the protocol and server behavior are unchanged. The first numbered release
 was **1.0.0**. The client version is always visible
 below the connection/chat interface, including when disconnected. It describes
 the loaded client, not the server it connects to. After connection, the server
@@ -81,6 +82,27 @@ unavailable, enter connection details again; server history is still saved.
 The database survives server restarts. Back it up while the server is stopped
 and protect it as chat data. It is excluded from Git. Messages sent before this
 feature was installed cannot be recovered.
+
+## Sending images by URL
+
+Paste a direct HTTP or HTTPS image URL into a message, optionally with other text.
+The updated client shows the image underneath the original message. It recognizes
+`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.avif`, `.bmp`, `.svg` and `.ico` URLs
+(case-insensitive), including query strings and fragments, or URLs with an image
+`format` query parameter such as `?format=webp`. Multiple distinct image URLs in
+one message each get a preview. Ordinary webpage links are not previewed.
+
+Images fit the message width and are at most 240 pixels tall. Failed loads show
+an error under the message, leaving the original text intact. Only URL text is
+stored in the database; previews are also rendered from history after refresh.
+The external image must remain available. This feature does not upload image files.
+
+Images load directly from the image host in the recipient's browser without a
+referrer header; that host still sees the recipient's IP and may receive its own
+cookies. Only send image URLs you trust. Non-HTTP(S) URLs and URLs containing
+credentials are not previewed. SVG is loaded as an image, never embedded as HTML.
+No new protocol fields or events are needed: older clients show the URL as text,
+and the updated client can preview image URLs received from older clients/servers.
 
 ## WebSocket protocol and compatibility
 
