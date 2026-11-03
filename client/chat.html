@@ -101,6 +101,22 @@
             cursor: pointer;
             padding: 8px 0;
         }
+
+        #pollPanel summary {
+            cursor: pointer;
+            padding: 8px 0;
+        }
+
+        #pollList {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .poll-card {
+            border: 1px solid #ccc;
+            padding: 8px;
+            margin: 8px 0;
+        }
     </style>
 </head>
 <body>
@@ -140,6 +156,18 @@
                 </fieldset>
             </details>
         </form>
+        <details id="pollPanel" hidden>
+            <summary id="pollSummary">Polls</summary>
+            <form id="createPollForm">
+                <label for="pollQuestion">Question</label>
+                <input id="pollQuestion" maxlength="240" required autocomplete="off">
+                <label for="pollOptions">Options (one per line, 2 to 20)</label>
+                <textarea id="pollOptions" rows="3" required></textarea>
+                <button type="submit">Start poll</button>
+            </form>
+            <p id="pollStatus" role="status"></p>
+            <div id="pollList"></div>
+        </details>
         <ul id="messages" aria-live="polite"></ul>
         <form id="sendForm">
             <input id="message" placeholder="Type a message..." autocomplete="off">
@@ -151,7 +179,7 @@
     <p id="serverVersion" hidden></p>
 
     <script>
-        const CLIENT_VERSION = "1.3.2";
+        const CLIENT_VERSION = "1.4.0";
         let socket;
         let username;
         let joined = false;
@@ -161,6 +189,7 @@
         let isRoomAdmin = false;
         let savingSettings = false;
         let supportsHistory = false;
+        let supportsPolls = false;
         let resumeRoom = null;
         let connectionSettings = null;
 
@@ -182,6 +211,95 @@
         const privateRoom = document.getElementById("privateRoom");
         const allowedUsernames = document.getElementById("allowedUsernames");
         const backgroundColor = document.getElementById("backgroundColor");
+        const pollPanel = document.getElementById("pollPanel");
+        const pollList = document.getElementById("pollList");
+        const pollStatus = document.getElementById("pollStatus");
+        const pollSummary = document.getElementById("pollSummary");
+        const createPollForm = document.getElementById("createPollForm");
+
+        function resetPolls() {
+            pollPanel.open = false;
+            pollList.replaceChildren();
+            pollSummary.textContent = "Polls (0)";
+            pollStatus.textContent = "";
+            createPollForm.reset();
+        }
+
+        function sendPoll(event) {
+            if (!joined || !supportsPolls || socket.readyState !== WebSocket.OPEN || changingRoom) {
+                pollStatus.textContent = "Connect and wait for the room change before using polls.";
+                return;
+            }
+            pollStatus.textContent = "Saving poll change...";
+            socket.send(JSON.stringify(event));
+        }
+
+        function renderPoll(poll) {
+            let card = document.getElementById(`poll-${poll.id}`);
+            if (!card) {
+                card = document.createElement("section");
+                card.id = `poll-${poll.id}`;
+                card.className = "poll-card";
+                const heading = document.createElement("h3");
+                heading.textContent = poll.question;
+                const creator = document.createElement("p");
+                creator.textContent = `Started by ${poll.username}. One vote per username; you can change your vote.`;
+                const results = document.createElement("div");
+                results.className = "poll-results";
+                const form = document.createElement("form");
+                const input = document.createElement("input");
+                input.maxLength = 100;
+                input.required = true;
+                input.placeholder = "Add a new option";
+                input.setAttribute("aria-label", `New option for ${poll.question}`);
+                const button = document.createElement("button");
+                button.type = "submit";
+                button.textContent = "Add option";
+                form.append(input, button);
+                form.addEventListener("submit", event => {
+                    event.preventDefault();
+                    const text = input.value.trim();
+                    if (!text) {
+                        pollStatus.textContent = "Enter an option with 1 to 100 characters.";
+                        return;
+                    }
+                    sendPoll({type: "add_poll_option", poll_id: poll.id, text});
+                });
+                card.append(heading, creator, results, form);
+                pollList.appendChild(card);
+            }
+            const results = card.querySelector(".poll-results");
+            const focusedOption = results.contains(document.activeElement) ? document.activeElement.dataset.option : null;
+            results.replaceChildren();
+            for (const option of poll.options) {
+                const row = document.createElement("p");
+                const button = document.createElement("button");
+                button.type = "button";
+                button.dataset.option = String(option.id);
+                button.textContent = `Vote: ${option.text} (${option.voters.length})`;
+                button.setAttribute("aria-pressed", String(option.voters.includes(username)));
+                button.addEventListener("click", () => sendPoll({
+                    type: "vote_poll", poll_id: poll.id, option_id: option.id,
+                }));
+                row.append(button, document.createTextNode(
+                    ` - ${option.voters.length ? option.voters.join(", ") : "No votes yet"}`
+                ));
+                results.appendChild(row);
+                if (button.dataset.option === focusedOption) button.focus();
+            }
+            pollSummary.textContent = `Polls (${pollList.children.length})`;
+        }
+
+        createPollForm.addEventListener("submit", event => {
+            event.preventDefault();
+            const question = document.getElementById("pollQuestion").value.trim();
+            const options = document.getElementById("pollOptions").value.split(/\r?\n/).map(text => text.trim()).filter(Boolean);
+            if (!question || options.length < 2 || options.length > 20 || options.some(text => text.length > 100)) {
+                pollStatus.textContent = "Enter a question and 2 to 20 options, each up to 100 characters.";
+                return;
+            }
+            sendPoll({type: "create_poll", question, options});
+        });
 
         document.getElementById("clientVersion").textContent = `Client version: ${CLIENT_VERSION}`;
 
@@ -336,6 +454,9 @@
             statusText.textContent = "Connecting...";
             connectButton.disabled = true;
             joined = false;
+            resetPolls();
+            supportsPolls = false;
+            pollPanel.hidden = true;
             supportsHistory = false;
             connectionSettings = {username, ip, port};
             resetRoomSettings();
@@ -365,7 +486,7 @@
             socket.onopen = () => {
                 socket.send(JSON.stringify({
                     type: "join", username, icon,
-                    features: ["rooms", "icons", "versions", "room_admin", "history"],
+                    features: ["rooms", "icons", "versions", "room_admin", "history", "polls"],
                     client_version: CLIENT_VERSION,
                 }));
             };
@@ -390,6 +511,9 @@
                         connectDiv.hidden = true;
                         chatDiv.hidden = false;
                         room = data.room || null;
+                        resetPolls();
+                        supportsPolls = Array.isArray(data.features) && data.features.includes("polls");
+                        pollPanel.hidden = !supportsPolls;
                         supportsHistory = Array.isArray(data.features) && data.features.includes("history");
                         resetRoomSettings();
                         supportsRoomAdmin = Array.isArray(data.features) && data.features.includes("room_admin");
@@ -426,6 +550,7 @@
                     case "room_joined":
                         if (room !== data.room) messages.replaceChildren();
                         resetRoomSettings();
+                        resetPolls();
                         room = data.room;
                         roomName.value = room;
                         rememberConnection();
@@ -440,6 +565,27 @@
                         break;
                     case "room_state":
                         applyRoomState(data);
+                        break;
+                    case "polls":
+                        if (!supportsPolls || data.room !== room) break;
+                        if (!Array.isArray(data.polls)) {
+                            pollStatus.textContent = "Received invalid polls from the server.";
+                            break;
+                        }
+                        pollList.replaceChildren();
+                        for (const poll of data.polls) renderPoll(poll);
+                        pollSummary.textContent = `Polls (${pollList.children.length})`;
+                        break;
+                    case "poll_updated":
+                        if (!supportsPolls || data.room !== room) break;
+                        renderPoll(data.poll);
+                        if (data.actor === username) {
+                            pollStatus.textContent = "Poll change saved.";
+                            if (data.action === "create_poll") createPollForm.reset();
+                            if (data.action === "add_poll_option") {
+                                document.getElementById(`poll-${data.poll.id}`).querySelector("input").value = "";
+                            }
+                        }
                         break;
                     case "history":
                         if (!supportsHistory || data.room !== room) break;
@@ -471,6 +617,7 @@
                         if (savingSettings) adminStatus.textContent = data.message;
                         savingSettings = false;
                         statusText.textContent = data.message;
+                        if (supportsPolls) pollStatus.textContent = data.message;
                         addMessage(data.message, "system");
                         break;
                     default:
@@ -485,6 +632,9 @@
             socket.onclose = () => {
                 if (joined) addMessage("Disconnected", "system");
                 joined = false;
+                resetPolls();
+                supportsPolls = false;
+                pollPanel.hidden = true;
                 resetRoomSettings();
                 supportsRoomAdmin = false;
                 serverVersion.hidden = true;

@@ -5,8 +5,8 @@ Run `python server\chatserver.py` with the `websockets` package installed, then 
 
 ## Versions
 
-The current client release is **1.3.2** (image URLs without file extensions); the server remains
-**1.2.0** because the protocol and server behavior are unchanged. The first numbered release
+The current client release is **1.4.0** and server release is **1.3.0**
+(persistent room polls). The first numbered release
 was **1.0.0**. The client version is always visible
 below the connection/chat interface, including when disconnected. It describes
 the loaded client, not the server it connects to. After connection, the server
@@ -113,6 +113,50 @@ cookies. Only send image URLs you trust. Non-HTTP(S) URLs and URLs containing
 credentials are not previewed. SVG is loaded as an image, never embedded as HTML.
 No new protocol fields or events are needed: older clients show the URL as text,
 and the updated client can preview image URLs received from older clients/servers.
+
+## Polls
+
+Open **Polls** in the current room, enter a question and 2–20 options (one per
+line), then select **Start poll**. Any poll-aware member may create polls, vote,
+and add options using **Add option**. Each username has one vote per poll;
+selecting a different option replaces the previous vote. Names are compared
+case-insensitively, including after reconnecting.
+
+Each option shows its vote count and the usernames who chose it. Votes are public,
+not anonymous. Questions are limited to 240 characters, options to 100 characters,
+and duplicate options are rejected case-insensitively. A room can contain up to
+100 polls, each with at most 20 options. Polls remain open; no closing/deletion
+feature is provided. All polls, options and votes are saved in SQLite and restored
+on room join, refresh and server restart. Only members of the current room can
+view or change its polls; private-room access rules still apply.
+
+The panel is collapsed by default and its poll list scrolls when expanded.
+As with room access, votes use unauthenticated usernames rather than verified
+identities. Someone can take an offline user's name and change that name's vote.
+
+### Poll protocol extension
+
+Request `polls` in `join.features`; the server acknowledges it in
+`joined.features`. On connection and room joins, these clients receive
+`{"type":"polls","room":"Lobby","polls":[]}` with the current room's saved polls.
+Use these events to change them:
+
+```json
+{"type":"create_poll","question":"What should we play?","options":["A","B"]}
+{"type":"add_poll_option","poll_id":1,"text":"C"}
+{"type":"vote_poll","poll_id":1,"option_id":2}
+```
+
+After committing a change, the server sends room members supporting polls:
+
+```json
+{"type":"poll_updated","room":"Lobby","action":"vote_poll","actor":"Alice","poll":{"id":1,"room":"Lobby","username":"Bob","question":"What should we play?","options":[{"id":1,"text":"A","voters":[]},{"id":2,"text":"B","voters":["Alice"]}]}}
+```
+
+The server assigns IDs and voter names; clients cannot choose someone else's name
+or modify polls in another room. Validation errors use the existing `error` event.
+Old clients do not receive new poll events and continue chatting normally.
+The updated client hides poll controls when connected to a server without polls.
 
 ## WebSocket protocol and compatibility
 

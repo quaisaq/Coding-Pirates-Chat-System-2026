@@ -77,6 +77,137 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
             "allowed_usernames": [], "background": "#ffffff", **extra,
         })
 
+    async def connect_poll_client(self, username):
+        connection, joined = await self.connect(username, features=["rooms", "polls"])
+        self.assertIn("polls", joined["features"])
+        await self.until(connection, "polls")
+        await self.until(connection, "rooms")
+        return connection
+
+    async def test_polls_public_votes_change_options_and_persistence(self):
+        first = await self.connect_poll_client("First")
+        second = await self.connect_poll_client("Second")
+        await self.until(first, "rooms")
+        await self.send(first, {"type": "create_poll", "question": " What to play? ", "options": ["A", "B"]})
+        poll = (await self.receive(first))["poll"]
+        self.assertEqual(poll["question"], "What to play?")
+        self.assertEqual((await self.receive(second))["poll"], poll)
+        identifier = poll["id"]
+        first_option, second_option = [option["id"] for option in poll["options"]]
+        await self.send(first, {"type": "vote_poll", "poll_id": identifier, "option_id": first_option, "username": "Forged"})
+        poll = (await self.receive(first))["poll"]
+        await self.receive(second)
+        self.assertEqual(poll["options"][0]["voters"], ["First"])
+        await self.send(second, {"type": "vote_poll", "poll_id": identifier, "option_id": first_option})
+        await self.receive(first)
+        poll = (await self.receive(second))["poll"]
+        self.assertEqual(poll["options"][0]["voters"], ["First", "Second"])
+        await self.send(first, {"type": "vote_poll", "poll_id": identifier, "option_id": second_option})
+        poll = (await self.receive(first))["poll"]
+        await self.receive(second)
+        self.assertEqual(poll["options"][0]["voters"], ["Second"])
+        self.assertEqual(poll["options"][1]["voters"], ["First"])
+        await self.send(second, {"type": "add_poll_option", "poll_id": identifier, "text": " C "})
+        poll = (await self.receive(second))["poll"]
+        await self.receive(first)
+        self.assertEqual(poll["options"][2]["text"], "C")
+        await first.close()
+        await second.close()
+        chatserver.close_database()
+        chatserver.initialize_database(self.database_path)
+        reconnect = await self.connect_poll_client("FIRST")
+        self.assertEqual(chatserver.poll_state(identifier), poll)
+        await self.send(reconnect, {"type": "vote_poll", "poll_id": identifier, "option_id": first_option})
+        poll = (await self.receive(reconnect))["poll"]
+        self.assertEqual(poll["options"][0]["voters"], ["FIRST", "Second"])
+        self.assertEqual(poll["options"][1]["voters"], [])
+        self.assertEqual(chatserver.get_database().execute("SELECT count(*) FROM poll_votes").fetchone()[0], 2)
+
+    async def test_poll_room_isolation_private_access_and_legacy_gate(self):
+        owner = await self.connect_admin_client("Owner")
+        await self.enter_room(owner, "Private")
+        await self.update_room(owner, "Private", private=True, allowed_usernames=["Friend"])
+        await self.until(owner, "room_state")
+        await self.until(owner, "rooms")
+        friend = await self.connect_poll_client("Friend")
+        await self.send(friend, {"type": "join_room", "room": "Private"})
+        await self.until(friend, "room_joined")
+        self.assertEqual((await self.receive(friend))["polls"], [])
+        await self.until(friend, "rooms")
+        outsider = await self.connect_poll_client("Outsider")
+        await self.until(friend, "rooms")
+        for _ in range(3):
+            await self.until(owner, "rooms")
+        await self.send(friend, {"type": "create_poll", "question": "Private question", "options": ["A", "B"]})
+        poll = (await self.receive(friend))["poll"]
+        await self.assert_quiet(outsider)
+        await self.assert_quiet(owner)
+        for event in (
+            {"type": "vote_poll", "poll_id": poll["id"], "option_id": poll["options"][0]["id"]},
+            {"type": "add_poll_option", "poll_id": poll["id"], "text": "Intruder"},
+            {"type": "join_room", "room": "Private"},
+        ):
+            await self.send(outsider, event)
+            self.assertEqual((await self.receive(outsider))["type"], "error")
+        legacy, _ = await self.connect("Legacy")
+        await self.send(legacy, {"type": "create_poll", "question": "No", "options": ["A", "B"]})
+        self.assertEqual((await self.receive(legacy))["type"], "error")
+        await self.assert_quiet(legacy)
+        await self.until(friend, "rooms")
+        await self.update_room(owner, "Private", private=True, allowed_usernames=[])
+        await self.until(friend, "room_joined")
+        self.assertEqual((await self.receive(friend))["polls"], [])
+        await self.until(friend, "rooms")
+        await self.send(friend, {"type": "vote_poll", "poll_id": poll["id"], "option_id": poll["options"][0]["id"]})
+        self.assertEqual((await self.receive(friend))["type"], "error")
+
+    async def test_poll_validation_limits_and_failed_write(self):
+        connection = await self.connect_poll_client("PollUser")
+        for event in (
+            {"type": "create_poll", "question": "", "options": ["A", "B"]},
+            {"type": "create_poll", "question": "x" * 241, "options": ["A", "B"]},
+            {"type": "create_poll", "question": "Q", "options": ["A"]},
+            {"type": "create_poll", "question": "Q", "options": ["A", " a "]},
+            {"type": "create_poll", "question": "Q", "options": ["A", "x" * 101]},
+            {"type": "create_poll", "question": "Q", "options": ["A", 42]},
+            {"type": "vote_poll", "poll_id": True, "option_id": 1},
+            {"type": "vote_poll", "poll_id": 2**100, "option_id": 1},
+        ):
+            await self.send(connection, event)
+            self.assertEqual((await self.receive(connection))["type"], "error")
+        await self.send(connection, {"type": "create_poll", "question": "x" * 240, "options": [f"Option{i}" for i in range(20)]})
+        poll = (await self.receive(connection))["poll"]
+        for event in (
+            {"type": "add_poll_option", "poll_id": poll["id"], "text": "Too many"},
+            {"type": "vote_poll", "poll_id": poll["id"], "option_id": True},
+            {"type": "vote_poll", "poll_id": poll["id"], "option_id": 2**100},
+        ):
+            await self.send(connection, event)
+            self.assertEqual((await self.receive(connection))["type"], "error")
+        await self.send(connection, {"type": "create_poll", "question": "Q", "options": ["A", "B"]})
+        second = (await self.receive(connection))["poll"]
+        await self.send(connection, {"type": "vote_poll", "poll_id": poll["id"], "option_id": second["options"][0]["id"]})
+        self.assertEqual((await self.receive(connection))["type"], "error")
+        await self.send(connection, {"type": "add_poll_option", "poll_id": second["id"], "text": " a "})
+        self.assertEqual((await self.receive(connection))["type"], "error")
+        await self.send(connection, {"type": "add_poll_option", "poll_id": second["id"], "text": "x" * 100})
+        await self.receive(connection)
+        with chatserver.get_database():
+            chatserver.get_database().executemany(
+                "INSERT INTO polls (room, username, question) VALUES (?, ?, ?)",
+                [("Lobby", "PollUser", f"Q{i}") for i in range(98)],
+            )
+        await self.send(connection, {"type": "create_poll", "question": "Full", "options": ["A", "B"]})
+        self.assertEqual((await self.receive(connection))["type"], "error")
+        before = chatserver.poll_state(second["id"])
+        chatserver.get_database().execute("PRAGMA query_only = ON")
+        with self.assertLogs(level="ERROR"):
+            await self.send(connection, {"type": "vote_poll", "poll_id": second["id"], "option_id": second["options"][0]["id"]})
+            self.assertEqual((await self.receive(connection))["type"], "error")
+            await connection.wait_closed()
+        self.assertEqual(chatserver.poll_state(second["id"]), before)
+        chatserver.get_database().execute("PRAGMA query_only = OFF")
+
     async def test_admin_access_list_revocation_and_background(self):
         admin = await self.connect_admin_client("Owner")
         state = await self.enter_room(admin, "Managed")

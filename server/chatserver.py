@@ -11,7 +11,9 @@ from pathlib import Path
 import websockets
 
 clients = {}
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
+MAX_POLLS_PER_ROOM = 100
+MAX_POLL_OPTIONS = 20
 DATABASE_PATH = Path(__file__).with_name("chat.db")
 HISTORY_LIMIT = 100
 database: sqlite3.Connection | None = None
@@ -30,6 +32,7 @@ class Client:
     supports_rooms: bool = False
     supports_room_admin: bool = False
     supports_history: bool = False
+    supports_polls: bool = False
 
 
 @dataclass
@@ -71,6 +74,35 @@ def initialize_database(path=DATABASE_PATH):
                 )
             """)
             connection.execute("CREATE INDEX IF NOT EXISTS messages_room_id ON messages(room, id)")
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS polls (
+                    id INTEGER PRIMARY KEY,
+                    room TEXT NOT NULL REFERENCES rooms(name),
+                    username TEXT NOT NULL,
+                    question TEXT NOT NULL
+                )
+            """)
+            connection.execute("CREATE INDEX IF NOT EXISTS polls_room_id ON polls(room, id)")
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS poll_options (
+                    id INTEGER PRIMARY KEY,
+                    poll_id INTEGER NOT NULL REFERENCES polls(id),
+                    text TEXT NOT NULL,
+                    text_key TEXT NOT NULL,
+                    UNIQUE(poll_id, text_key),
+                    UNIQUE(poll_id, id)
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS poll_votes (
+                    poll_id INTEGER NOT NULL REFERENCES polls(id),
+                    username_key TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    option_id INTEGER NOT NULL,
+                    PRIMARY KEY(poll_id, username_key),
+                    FOREIGN KEY(poll_id, option_id) REFERENCES poll_options(poll_id, id)
+                )
+            """)
             connection.execute(
                 "INSERT OR IGNORE INTO rooms VALUES (?, NULL, 0, '[]', '#ffffff')", (LOBBY,),
             )
@@ -140,6 +172,102 @@ def notify_history(websocket):
         }))
 
 
+def poll_state(poll_id):
+    connection = get_database()
+    identifier, room, username, question = connection.execute(
+        "SELECT id, room, username, question FROM polls WHERE id = ?", (poll_id,),
+    ).fetchone()
+    options = [
+        {"id": option_id, "text": text, "voters": []}
+        for option_id, text in connection.execute(
+            "SELECT id, text FROM poll_options WHERE poll_id = ? ORDER BY id", (poll_id,),
+        )
+    ]
+    by_id = {option["id"]: option for option in options}
+    for option_id, voter in connection.execute(
+        "SELECT option_id, username FROM poll_votes WHERE poll_id = ? ORDER BY username_key", (poll_id,),
+    ):
+        by_id[option_id]["voters"].append(voter)
+    return {"id": identifier, "room": room, "username": username, "question": question, "options": options}
+
+
+def notify_polls(websocket):
+    client = clients[websocket]
+    if client.supports_polls:
+        identifiers = get_database().execute(
+            "SELECT id FROM polls WHERE room = ? ORDER BY id", (client.room,),
+        ).fetchall()
+        websockets.broadcast({websocket}, encode_event({
+            "type": "polls", "room": client.room,
+            "polls": [poll_state(identifier) for (identifier,) in identifiers],
+        }))
+
+
+def poll_text(value, label, maximum):
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
+        raise ValueError(f"{label} must be 1 to {maximum} characters.")
+    return value.strip()
+
+
+def change_poll(client, event):
+    connection = get_database()
+    if event["type"] == "create_poll":
+        question = poll_text(event.get("question"), "Question", 240)
+        options = event.get("options")
+        if not isinstance(options, list) or not 2 <= len(options) <= MAX_POLL_OPTIONS:
+            raise ValueError(f"Provide 2 to {MAX_POLL_OPTIONS} options.")
+        options = [poll_text(option, "Option", 100) for option in options]
+        if len({option.casefold() for option in options}) != len(options):
+            raise ValueError("Poll options must be distinct.")
+        if connection.execute("SELECT count(*) FROM polls WHERE room = ?", (client.room,)).fetchone()[0] >= MAX_POLLS_PER_ROOM:
+            raise ValueError(f"A room allows at most {MAX_POLLS_PER_ROOM} polls.")
+        with connection:
+            cursor = connection.execute(
+                "INSERT INTO polls (room, username, question) VALUES (?, ?, ?)",
+                (client.room, client.username, question),
+            )
+            identifier = cursor.lastrowid
+            connection.executemany(
+                "INSERT INTO poll_options (poll_id, text, text_key) VALUES (?, ?, ?)",
+                [(identifier, option, option.casefold()) for option in options],
+            )
+        return identifier
+
+    identifier = event.get("poll_id")
+    if type(identifier) is not int or not 1 <= identifier <= 2**63 - 1 or connection.execute(
+        "SELECT id FROM polls WHERE id = ? AND room = ?", (identifier, client.room),
+    ).fetchone() is None:
+        raise ValueError("Choose a poll in your current room.")
+    if event["type"] == "add_poll_option":
+        text = poll_text(event.get("text"), "Option", 100)
+        if connection.execute(
+            "SELECT count(*) FROM poll_options WHERE poll_id = ?", (identifier,),
+        ).fetchone()[0] >= MAX_POLL_OPTIONS:
+            raise ValueError(f"A poll allows at most {MAX_POLL_OPTIONS} options.")
+        if connection.execute(
+            "SELECT id FROM poll_options WHERE poll_id = ? AND text_key = ?", (identifier, text.casefold()),
+        ).fetchone() is not None:
+            raise ValueError("That option already exists.")
+        with connection:
+            connection.execute(
+                "INSERT INTO poll_options (poll_id, text, text_key) VALUES (?, ?, ?)",
+                (identifier, text, text.casefold()),
+            )
+    else:
+        option_id = event.get("option_id")
+        if type(option_id) is not int or not 1 <= option_id <= 2**63 - 1 or connection.execute(
+            "SELECT id FROM poll_options WHERE id = ? AND poll_id = ?", (option_id, identifier),
+        ).fetchone() is None:
+            raise ValueError("Choose an option belonging to this poll.")
+        with connection:
+            connection.execute("""
+                INSERT INTO poll_votes VALUES (?, ?, ?, ?)
+                ON CONFLICT(poll_id, username_key) DO UPDATE SET
+                    username=excluded.username, option_id=excluded.option_id
+            """, (identifier, client.username.casefold(), client.username, option_id))
+    return identifier
+
+
 def is_admin(client, settings):
     return settings.admin is not None and settings.admin.casefold() == client.username.casefold()
 
@@ -184,6 +312,7 @@ def move_client(websocket, room, reason=None):
     websockets.broadcast({websocket}, encode_event(event))
     notify_room_state(websocket)
     notify_history(websocket)
+    notify_polls(websocket)
     if previous_room != room:
         broadcast({"type": "user_left", "username": client.username}, exclude=websocket, room=previous_room)
         broadcast({"type": "user_joined", "username": client.username}, exclude=websocket, room=room)
@@ -321,6 +450,7 @@ async def handler(websocket):
                     supports_rooms=isinstance(features, list) and "rooms" in features,
                     supports_room_admin=isinstance(features, list) and "rooms" in features and "room_admin" in features,
                     supports_history=isinstance(features, list) and "history" in features,
+                    supports_polls=isinstance(features, list) and "polls" in features,
                 )
                 clients[websocket] = client
                 response = {
@@ -335,9 +465,12 @@ async def handler(websocket):
                     response["server_version"] = SERVER_VERSION
                 if client.supports_history:
                     response.setdefault("features", []).append("history")
+                if client.supports_polls:
+                    response.setdefault("features", []).append("polls")
                 await websocket.send(encode_event(response))
                 notify_room_state(websocket)
                 notify_history(websocket)
+                notify_polls(websocket)
                 broadcast(
                     {"type": "user_joined", "username": username},
                     exclude=websocket, room=client.room,
@@ -346,6 +479,24 @@ async def handler(websocket):
                 continue
 
             client = clients[websocket]
+            if event.get("type") in ("create_poll", "add_poll_option", "vote_poll"):
+                if not client.supports_polls:
+                    await send_error(websocket, "Declare the polls feature when joining first.")
+                    continue
+                try:
+                    identifier = change_poll(client, event)
+                except ValueError as error:
+                    await send_error(websocket, str(error))
+                    continue
+                recipients = {
+                    member_socket for member_socket, member in clients.items()
+                    if member.room == client.room and member.supports_polls
+                }
+                websockets.broadcast(recipients, encode_event({
+                    "type": "poll_updated", "room": client.room, "poll": poll_state(identifier),
+                    "action": event["type"], "actor": username,
+                }))
+                continue
             if event.get("type") == "join_room":
                 if not client.supports_rooms:
                     await send_error(websocket, "Declare the rooms feature when joining first.")
