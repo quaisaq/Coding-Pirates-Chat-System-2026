@@ -151,7 +151,7 @@
     <p id="serverVersion" hidden></p>
 
     <script>
-        const CLIENT_VERSION = "1.3.1";
+        const CLIENT_VERSION = "1.3.2";
         let socket;
         let username;
         let joined = false;
@@ -254,10 +254,7 @@
                     continue;
                 }
                 if (url.username || url.password) continue;
-                if (/\.(png|jpe?g|gif|webp|avif|bmp|svg|ico)$/i.test(url.pathname) ||
-                    /^(png|jpe?g|gif|webp|avif|bmp|svg|ico)$/i.test(url.searchParams.get("format") || "")) {
-                    urls.add(url.href);
-                }
+                urls.add(url.href);
             }
             return urls;
         }
@@ -287,7 +284,7 @@
                     image.addEventListener("error", () => {
                         const error = document.createElement("span");
                         error.className = "image-error";
-                        error.textContent = `Could not load image: ${url}`;
+                        error.textContent = `No image preview available (not an image or could not be loaded): ${url}`;
                         image.replaceWith(error);
                     }, {once: true});
                     image.src = url;

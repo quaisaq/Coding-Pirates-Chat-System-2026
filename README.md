@@ -5,7 +5,7 @@ Run `python server\chatserver.py` with the `websockets` package installed, then 
 
 ## Versions
 
-The current client release is **1.3.1** (collapsible administration settings); the server remains
+The current client release is **1.3.2** (image URLs without file extensions); the server remains
 **1.2.0** because the protocol and server behavior are unchanged. The first numbered release
 was **1.0.0**. The client version is always visible
 below the connection/chat interface, including when disconnected. It describes
@@ -91,18 +91,23 @@ feature was installed cannot be recovered.
 ## Sending images by URL
 
 Paste a direct HTTP or HTTPS image URL into a message, optionally with other text.
-The updated client shows the image underneath the original message. It recognizes
-`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.avif`, `.bmp`, `.svg` and `.ico` URLs
-(case-insensitive), including query strings and fragments, or URLs with an image
-`format` query parameter such as `?format=webp`. Multiple distinct image URLs in
-one message each get a preview. Ordinary webpage links are not previewed.
+The updated client tries each distinct HTTP/HTTPS URL as an image underneath the
+original message. No file extension or `format` parameter is required, so image
+endpoints such as `/images?id=123` work if they return a browser-supported image.
+Query strings and fragments are preserved. Redirects are handled by the browser.
+Ordinary webpage links cannot be displayed as images.
 
 Images fit the message width and are at most 240 pixels tall. Failed loads show
-an error under the message, leaving the original text intact. Only URL text is
+a "No image preview available" notice under the message, leaving the original text
+intact. The browser cannot distinguish a non-image response from a blocked,
+expired or otherwise unavailable image. Hosts requiring login or blocking image
+embedding may still fail; this feature does not bypass those restrictions.
+Only URL text is
 stored in the database; previews are also rendered from history after refresh.
 The external image must remain available. This feature does not upload image files.
 
-Images load directly from the image host in the recipient's browser without a
+Preview attempts contact every HTTP/HTTPS URL in a message, not just known image
+hosts. Images load directly from the host in the recipient's browser without a
 referrer header; that host still sees the recipient's IP and may receive its own
 cookies. Only send image URLs you trust. Non-HTTP(S) URLs and URLs containing
 credentials are not previewed. SVG is loaded as an image, never embedded as HTML.
